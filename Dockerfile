@@ -52,4 +52,6 @@ RUN git config --global user.email "noreply@anthropic.com" \
     && git config --global user.name "Claude"
 
 EXPOSE 3000
+
+# Default to controller mode; worker mode uses: node src/worker.js
 CMD ["node", "src/server.js"]
