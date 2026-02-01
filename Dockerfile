@@ -1,4 +1,10 @@
-FROM node:20-slim
+FROM node:22.22.0-slim
+
+ARG CLAUDE_CODE_VERSION=2.1.29
+
+# Git identity defaults (can be overridden at runtime)
+ENV GIT_USER_EMAIL=noreply@anthropic.com
+ENV GIT_USER_NAME=Claude
 
 RUN apt-get update && apt-get install -y \
     git \
@@ -13,19 +19,23 @@ RUN apt-get update && apt-get install -y \
 # gh CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
-    && apt-get update && apt-get install -y gh
+    && apt-get update && apt-get install -y gh \
+    && rm -rf /var/lib/apt/lists/*
 
 # Claude Code
-RUN npm install -g @anthropic-ai/claude-code
+RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
 # Create ~/.claude directory for Claude Code credentials and runtime files
 # Only .credentials.json is mounted from host; other files stay in container
 RUN mkdir -p /home/node/.claude && chown -R node:node /home/node
 
 WORKDIR /app
-COPY package.json ./
-RUN npm install
+COPY package.json package-lock.json ./
+RUN npm ci
 COPY src ./src
+
+# Make entrypoint executable
+RUN chmod +x src/entrypoint.sh
 
 # Give node user ownership of app
 RUN chown -R node:node /app
@@ -47,11 +57,10 @@ ENV PATH=/home/node/.local/bin:/home/node/.cargo/bin:/home/node/go/bin:/home/nod
 # Switch to non-root user
 USER node
 
-# Git config for commits (as node user)
-RUN git config --global user.email "noreply@anthropic.com" \
-    && git config --global user.name "Claude"
-
 EXPOSE 3000
+
+# Entrypoint configures git identity from env vars, then runs CMD
+ENTRYPOINT ["/app/src/entrypoint.sh"]
 
 # Default to controller mode; worker mode uses: node src/worker.js
 CMD ["node", "src/server.js"]

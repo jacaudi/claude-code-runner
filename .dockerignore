@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+
+# Git
+.git/
+.gitignore
+
+# Environment and secrets
+.env
+.env.*
+/data/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Documentation (not needed in image)
+docs/
+*.md
+!README.md
+
+# CI/CD
+.github/
+
+# Kubernetes manifests (not needed in image)
+k8s/
+
+# Development files
+docker-compose*.yml
