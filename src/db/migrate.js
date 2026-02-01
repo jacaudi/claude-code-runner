@@ -14,7 +14,15 @@ async function migrate() {
   const schema = readFileSync(path.join(__dirname, 'schema.sql'), 'utf-8');
 
   try {
-    await pool.query(schema);
+    // Split and execute statements individually
+    const statements = schema
+      .split(';')
+      .map(s => s.trim())
+      .filter(s => s.length > 0);
+
+    for (const statement of statements) {
+      await pool.query(statement);
+    }
     console.log('Migration complete');
   } catch (err) {
     console.error('Migration failed:', err.message);
