@@ -9,14 +9,23 @@ ENV GIT_USER_NAME=Claude
 RUN apt-get update && apt-get install -y \
     git \
     curl \
+    wget \
     ssh \
     python3 \
     make \
     g++ \
     jq \
     nano \
+    vim \
+    less \
+    tree \
+    unzip \
+    zip \
     shellcheck \
-    && rm -rf /var/lib/apt/lists/*
+    ripgrep \
+    fd-find \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s $(which fdfind) /usr/local/bin/fd
 
 # gh CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
@@ -32,6 +41,11 @@ RUN curl -fsSL "https://github.com/mikefarah/yq/releases/latest/download/yq_linu
 RUN curl -fsSL "https://gitlab.com/gitlab-org/cli/-/releases/permalink/latest/downloads/glab_$(dpkg --print-architecture).deb" -o /tmp/glab.deb \
     && dpkg -i /tmp/glab.deb \
     && rm /tmp/glab.deb
+
+# uv (fast Python package manager)
+RUN UV_ARCH=$(dpkg --print-architecture | sed 's/amd64/x86_64/' | sed 's/arm64/aarch64/') \
+    && curl -fsSL "https://github.com/astral-sh/uv/releases/latest/download/uv-${UV_ARCH}-unknown-linux-gnu.tar.gz" \
+    | tar -xz -C /usr/local/bin --strip-components=1
 
 # Claude Code
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
