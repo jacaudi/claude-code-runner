@@ -248,6 +248,7 @@
           <th>ID</th>
           <th>Prompt</th>
           <th>Status</th>
+          <th>Worker</th>
           <th>Started</th>
           <th>PR</th>
           <th>Logs</th>
@@ -388,14 +389,15 @@
 
         const tbody = document.getElementById('tasks');
         if (tasks.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="6" class="empty">No tasks yet</td></tr>';
+          tbody.innerHTML = '<tr><td colspan="7" class="empty">No tasks yet</td></tr>';
         } else {
           tbody.innerHTML = tasks.map(t => `
             <tr>
               <td><code>${t.id}</code></td>
               <td class="prompt" title="${escapeHtml(t.prompt)}">${escapeHtml(t.prompt.slice(0, 60))}${t.prompt.length > 60 ? '...' : ''}</td>
               <td><span class="status ${t.status}">${t.status}</span></td>
-              <td>${new Date(t.started).toLocaleString()}</td>
+              <td><code style="font-size: 11px;">${t.worker_job || t.worker_pod || '-'}</code></td>
+              <td>${new Date(t.started_at || t.started || t.created_at).toLocaleString()}</td>
               <td>${t.pr_url ? `<a href="${t.pr_url}" target="_blank">View PR</a>` : '-'}</td>
               <td><button class="log-btn" onclick="showLogs('${t.id}')">View</button></td>
             </tr>
