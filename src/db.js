@@ -2,6 +2,11 @@ import pg from 'pg';
 
 let pool = null;
 
+const ALLOWED_TASK_FIELDS = new Set([
+  'status', 'repository', 'branch', 'pr_url', 'error', 'error_type',
+  'worker_pod', 'worker_job', 'started_at', 'completed_at'
+]);
+
 export function initDb() {
   if (!process.env.DATABASE_URL) {
     console.log('DATABASE_URL not set, using in-memory fallback');
@@ -52,10 +57,10 @@ export async function listTasks(limit = 50) {
 export async function updateTask(id, updates) {
   if (!pool) throw new Error('Database not initialized');
 
-  const fields = Object.keys(updates);
+  const fields = Object.keys(updates).filter(f => ALLOWED_TASK_FIELDS.has(f));
   if (fields.length === 0) return;
 
-  const values = Object.values(updates);
+  const values = fields.map(f => updates[f]);
   const setClause = fields.map((f, i) => `${f} = $${i + 2}`).join(', ');
 
   await pool.query(
