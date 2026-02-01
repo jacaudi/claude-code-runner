@@ -47,6 +47,12 @@ RUN UV_ARCH=$(dpkg --print-architecture | sed 's/amd64/x86_64/' | sed 's/arm64/a
     && curl -fsSL "https://github.com/astral-sh/uv/releases/latest/download/uv-${UV_ARCH}-unknown-linux-gnu.tar.gz" \
     | tar -xz -C /usr/local/bin --strip-components=1
 
+# Go
+RUN GO_ARCH=$(dpkg --print-architecture) \
+    && curl -fsSL "https://go.dev/dl/go1.23.6.linux-${GO_ARCH}.tar.gz" \
+    | tar -xz -C /usr/local
+ENV PATH=/usr/local/go/bin:$PATH
+
 # Claude Code
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
