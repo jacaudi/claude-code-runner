@@ -1,6 +1,6 @@
 services:
   claude-runner:
-    image: ericvtheg/claude-code-runner
+    image: ghcr.io/jacaudi/claude-code-runner
     container_name: claude-code-runner
     ports:
       - "7334:3000"

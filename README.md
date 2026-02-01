@@ -1,7 +1,5 @@
 # Claude Code Runner
 
-[![Docker Pulls](https://img.shields.io/docker/pulls/ericvtheg/claude-code-runner)](https://hub.docker.com/r/ericvtheg/claude-code-runner)
-[![Docker Image Size](https://img.shields.io/docker/image-size/ericvtheg/claude-code-runner/latest)](https://hub.docker.com/r/ericvtheg/claude-code-runner)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 Self-hosted service that accepts coding task prompts via HTTP and spawns Claude Code instances to autonomously implement them. Uses your Claude Code subscription (no API key required).
@@ -20,14 +18,14 @@ Self-hosted service that accepts coding task prompts via HTTP and spawns Claude 
 claude
 
 # Then run the container
-docker pull ericvtheg/claude-code-runner:latest
+docker pull ghcr.io/jacaudi/claude-code-runner:latest
 ```
 
 ```yaml
 # docker-compose.yml
 services:
   claude-runner:
-    image: ericvtheg/claude-code-runner:latest
+    image: ghcr.io/jacaudi/claude-code-runner:latest
     ports:
       - "7334:3000"
     environment:
