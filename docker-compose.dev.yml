@@ -1,0 +1,32 @@
+# Development compose file with PostgreSQL
+# Use: docker compose -f docker-compose.dev.yml up
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: claude
+      POSTGRES_PASSWORD: devpassword
+      POSTGRES_DB: claude
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  claude-runner:
+    build: .
+    container_name: claude-code-runner
+    ports:
+      - "7334:3000"
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - DATABASE_URL=postgresql://claude:devpassword@postgres:5432/claude
+      - PORT=3000
+    volumes:
+      - ~/.claude/.credentials.json:/home/node/.claude/.credentials.json:ro
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
