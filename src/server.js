@@ -7,9 +7,17 @@ import { mkdir, rm, appendFile, readFile, writeFile, access } from 'fs/promises'
 import { createWriteStream, createReadStream, existsSync, readFileSync, writeFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import path from 'path';
+import * as db from './db.js';
+import * as k8s from './k8s.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Detect operating mode
+const USE_K8S = k8s.initK8s();
+const USE_DB = db.initDb();
+
+console.log(`Mode: K8s=${USE_K8S}, DB=${USE_DB}`);
 
 const app = express();
 app.use(express.json());
@@ -343,42 +351,87 @@ app.post('/task', async (req, res) => {
   }
 
   const id = randomUUID().slice(0, 8);
-  const taskDir = path.join(WORK_DIR, id);
 
-  await mkdir(taskDir, { recursive: true });
+  if (USE_DB && USE_K8S) {
+    // Kubernetes mode: store in DB, create Job
+    try {
+      await db.createTask(id, prompt);
 
-  tasks.set(id, {
-    status: 'running',
-    prompt,
-    started: new Date().toISOString(),
-    logFile: path.join(taskDir, 'output.log')
-  });
+      const job = await k8s.createWorkerJob(id, prompt);
+      await db.updateTask(id, {
+        status: 'running',
+        worker_job: job.metadata.name,
+        started_at: new Date()
+      });
 
-  runTask(id, prompt, taskDir).catch(err => {
+      return res.json({ id, status: 'running' });
+    } catch (err) {
+      console.error('Failed to create task:', err);
+      if (USE_DB) {
+        await db.updateTask(id, {
+          status: 'failed',
+          error: err.message,
+          error_type: 'job_creation_failed'
+        }).catch(() => {});
+      }
+      return res.status(500).json({ error: 'Failed to create worker job' });
+    }
+  } else {
+    // Local mode: use existing pty-based implementation
+    const taskDir = path.join(WORK_DIR, id);
+    await mkdir(taskDir, { recursive: true });
+
     tasks.set(id, {
-      ...tasks.get(id),
-      status: 'failed',
-      error: err.message,
-      errorType: err.errorType || 'unknown',
-      finished: new Date().toISOString()
+      status: 'running',
+      prompt,
+      started: new Date().toISOString(),
+      logFile: path.join(taskDir, 'output.log')
     });
-  });
 
-  res.json({ id, status: 'queued' });
+    runTask(id, prompt, taskDir).catch(err => {
+      tasks.set(id, {
+        ...tasks.get(id),
+        status: 'failed',
+        error: err.message,
+        errorType: err.errorType || 'unknown',
+        finished: new Date().toISOString()
+      });
+    });
+
+    return res.json({ id, status: 'queued' });
+  }
 });
 
-app.get('/task/:id', (req, res) => {
-  const task = tasks.get(req.params.id);
-  if (!task) return res.status(404).json({ error: 'Not found' });
-  res.json({ id: req.params.id, ...task });
+app.get('/task/:id', async (req, res) => {
+  if (USE_DB) {
+    const task = await db.getTask(req.params.id);
+    if (!task) return res.status(404).json({ error: 'Not found' });
+    return res.json({ id: req.params.id, ...task });
+  } else {
+    const task = tasks.get(req.params.id);
+    if (!task) return res.status(404).json({ error: 'Not found' });
+    return res.json({ id: req.params.id, ...task });
+  }
 });
 
 app.get('/task/:id/logs', async (req, res) => {
-  const task = tasks.get(req.params.id);
-  if (!task) return res.status(404).json({ error: 'Not found' });
-
   res.setHeader('Content-Type', 'text/plain');
-  createReadStream(task.logFile).pipe(res);
+
+  if (USE_K8S) {
+    try {
+      const logs = await k8s.getPodLogs(req.params.id);
+      if (!logs) {
+        return res.send('(no logs yet - worker pod may still be starting)');
+      }
+      return res.send(logs);
+    } catch (err) {
+      return res.send(`(error fetching logs: ${err.message})`);
+    }
+  } else {
+    const task = tasks.get(req.params.id);
+    if (!task) return res.status(404).json({ error: 'Not found' });
+    createReadStream(task.logFile).pipe(res);
+  }
 });
 
 app.get('/health', (req, res) => {
@@ -390,13 +443,46 @@ app.get('/health', (req, res) => {
 });
 
 // List all tasks
-app.get('/tasks', (req, res) => {
-  const taskList = [...tasks.entries()].map(([id, task]) => ({
-    id,
-    ...task
-  }));
-  taskList.sort((a, b) => new Date(b.started) - new Date(a.started));
-  res.json(taskList);
+app.get('/tasks', async (req, res) => {
+  if (USE_DB) {
+    const taskList = await db.listTasks();
+    return res.json(taskList);
+  } else {
+    const taskList = [...tasks.entries()].map(([id, task]) => ({
+      id,
+      ...task
+    }));
+    taskList.sort((a, b) => new Date(b.started) - new Date(a.started));
+    return res.json(taskList);
+  }
+});
+
+// Internal endpoint for worker callbacks (K8s mode only)
+app.post('/internal/task/:id/status', async (req, res) => {
+  if (!USE_DB) {
+    return res.status(400).json({ error: 'Not in K8s mode' });
+  }
+
+  const { status, repository, branch, pr_url, error, error_type } = req.body;
+
+  const updates = {};
+  if (status) updates.status = status;
+  if (repository) updates.repository = repository;
+  if (branch) updates.branch = branch;
+  if (pr_url) updates.pr_url = pr_url;
+  if (error) updates.error = error;
+  if (error_type) updates.error_type = error_type;
+  if (status === 'completed' || status === 'failed') {
+    updates.completed_at = new Date();
+  }
+
+  try {
+    await db.updateTask(req.params.id, updates);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Failed to update task:', err);
+    res.status(500).json({ error: 'Failed to update task' });
+  }
 });
 
 // Dashboard UI
