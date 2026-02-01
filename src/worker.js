@@ -151,8 +151,8 @@ async function run() {
 }
 
 // Validate required env vars
-if (!TASK_ID || !TASK_PROMPT || !BRANCH_NAME) {
-  console.error('Missing required environment variables: TASK_ID, TASK_PROMPT, BRANCH_NAME');
+if (!TASK_ID || !TASK_PROMPT || !BRANCH_NAME || !process.env.GITHUB_TOKEN) {
+  console.error('Missing required environment variables: TASK_ID, TASK_PROMPT, BRANCH_NAME, GITHUB_TOKEN');
   process.exit(1);
 }
 
@@ -166,6 +166,24 @@ const timeout = setTimeout(async () => {
   });
   process.exit(1);
 }, TIMEOUT_MS);
+
+// Signal handlers for graceful shutdown
+let shuttingDown = false;
+async function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`\n=== Received ${signal}, shutting down ===`);
+  clearTimeout(timeout);
+  await callback({
+    status: 'failed',
+    error: `Worker terminated by ${signal}`,
+    error_type: 'signal'
+  });
+  process.exit(1);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 run()
   .then((code) => {
