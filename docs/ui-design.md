@@ -157,15 +157,93 @@ Card border color matches status:
 - **[Cancel]**: Calls `POST /task/:id/cancel` (queued/running tasks only)
 - **[Logs]**: Opens log modal (same as Tasks view)
 - **[PR]**: Opens PR URL in new tab
-- **Cards are NOT draggable** — Task status is controlled by the Runner, not the user. The board is for visualization, not manual workflow management.
 - **Completed/Failed columns**: Show most recent 20 tasks, with a "Show more" link that scrolls/paginates. Prevents the board from getting unwieldy.
+
+### Manual Status Changes (Drag & Move)
+
+Cards can be **dragged between columns** or moved via a status dropdown on the card. This allows users to manually override task status when they feel more work is needed.
+
+**Allowed transitions:**
+
+| From | To | What Happens |
+|------|----|-------------|
+| Completed → Queued | User wants to re-run the task. Controller creates a new worktree and re-dispatches the same prompt. The original PR/branch is preserved. |
+| Failed → Queued | Retry a failed task. Same behavior as above. |
+| Completed → Failed | User marks a task as failed (e.g., PR was inadequate). No re-dispatch; just status update. |
+| Queued → Failed | Cancel a queued task before it starts. |
+| Running → (any) | **Not allowed via drag.** Running tasks can only be cancelled via the [Cancel] button, which triggers graceful shutdown. |
+
+**Implementation:**
+- HTML5 Drag and Drop API (native, no library needed)
+- `dragstart` sets `dataTransfer` with task ID
+- Column `drop` handler calls `PATCH /task/:id` with new status
+- Visual feedback: ghost card on drag, column highlights on dragover
+- Invalid drops (e.g., dropping on Running column) show no drop cursor
+
+**Re-dispatch on move to Queued:**
+
+When a completed or failed task is moved back to Queued, the Controller:
+1. Creates a **new task** with the same prompt, project, and issue
+2. Links it as a retry: `retry_of` field on the new task
+3. The original task stays in its column (Completed/Failed) with a "Retried" badge
+4. The new task appears in the Queued column
+
+This preserves history — you can always see what the original task produced.
+
+```
+PATCH /task/:id
+{
+  "status": "queued"   // triggers re-dispatch
+}
+
+// Response
+{
+  "id": "task_original",
+  "status": "completed",       // original stays as-is
+  "retriedAs": "task_new123"   // new task was created
+}
+```
+
+**Card status dropdown (alternative to drag):**
+
+Each card has a `...` menu with available transitions:
+
+```
+┌─────────────────────────┐
+│ Fix auth token refresh  │
+│ my-api #42              │
+│ PR #156                 │
+│ [PR] [Logs] [···]       │
+│         ┌─────────────┐ │
+│         │ → Re-queue  │ │
+│         │ → Mark failed│ │
+│         └─────────────┘ │
+└─────────────────────────┘
+```
+
+### Plan Task Cards
+
+Plan tasks (type: `"plan"`) appear on the board with a distinct visual treatment:
+
+```
+┌─────────────────────────┐
+│ ◆ Plan: Fix auth #42    │  ← diamond icon + "Plan:" prefix
+│ my-api                  │
+│ 3 suggestions           │  ← suggestion count (when completed)
+│ [Review] [Logs]         │  ← "Review" links to issues view
+└─────────────────────────┘
+```
+
+- Plan cards have a **purple** left border (`#a855f7`) instead of the status color
+- Completed plan cards show suggestion count and a [Review] button
+- [Review] navigates to `#issues?project=<id>` with the issue expanded
 
 ### Board Layout
 
 - Columns use CSS grid: `grid-template-columns: repeat(4, 1fr)`
 - Each column scrolls independently (sticky headers)
 - Cards are vertically stacked with `8px` gap
-- Responsive: at `< 900px` width, columns stack vertically (mobile-friendly)
+- Responsive: at `< 900px` width, columns stack vertically. Drag disabled; use status dropdown instead.
 
 **API calls:**
 - `GET /tasks` — all tasks (5s refresh)
@@ -173,6 +251,7 @@ Card border color matches status:
 - `GET /runners` — for filter dropdown + runner ID display
 - `POST /task` — new task (from modal)
 - `POST /task/:id/cancel` — cancel task
+- `PATCH /task/:id` — manual status change / re-queue
 
 ## View 3: Projects
 
@@ -294,7 +373,7 @@ Issue management with filters. Primary place to create tasks from issues.
 │  │  ├─ task_a1b2 "Plan auth refactor"      completed  PR #155     │ │
 │  │  └─ task_c3d4 "Implement token refresh" running    15m ⏱       │ │
 │  │                                                                 │ │
-│  │  [+ Create Task]  [Sync]  [Close]  [View on GitHub ↗]         │ │
+│  │  [Generate Tasks]  [+ Manual Task]  [Close]  [GitHub ↗]        │ │
 │  └─────────────────────────────────────────────────────────────────┘ │
 │                                                                       │
 │  ┌─────────────────────────────────────────────────────────────────┐ │
@@ -304,14 +383,14 @@ Issue management with filters. Primary place to create tasks from issues.
 │  │  Tasks:                                                        │ │
 │  │  └─ task_e5f6 "Implement connection pool" completed  PR #156   │ │
 │  │                                                                 │ │
-│  │  [+ Create Task]  [Sync]  [Reopen]  [View on GitHub ↗]        │ │
+│  │  [Generate Tasks]  [+ Manual Task]  [Reopen]  [GitHub ↗]      │ │
 │  └─────────────────────────────────────────────────────────────────┘ │
 │                                                                       │
 │  ┌─────────────────────────────────────────────────────────────────┐ │
 │  │  #15  Update lodash to v5                     dependency  low  │ │
 │  │  ● open · synced from GitHub · 0 tasks                         │ │
 │  │                                                                 │ │
-│  │  [+ Create Task]  [View on GitHub ↗]                           │ │
+│  │  [Generate Tasks]  [+ Manual Task]  [GitHub ↗]                 │ │
 │  └─────────────────────────────────────────────────────────────────┘ │
 │                                                                       │
 │  Showing 3 of 12 issues                            [Load more]       │
@@ -361,9 +440,87 @@ Each issue shows whether it was:
 - **Created locally** — "created locally" (no forge number yet)
 - **Synced + local changes** — "modified locally" (edited after sync)
 
-### Create Task from Issue
+### Generate Tasks from Issue (AI-Assisted)
 
-Clicking **[+ Create Task]** on an issue opens a modal:
+Clicking **[Generate Tasks]** on an issue triggers a Claude plan task that analyzes the issue and codebase, then suggests concrete implementation tasks.
+
+**Step 1: Generate** — Launches a plan task.
+
+```
+┌──────────────────────────────────────────────────────┐
+│  Generate Tasks for #42                        [X]   │
+├──────────────────────────────────────────────────────┤
+│                                                      │
+│  Issue: Fix auth token refresh                       │
+│  Project: my-api                                     │
+│                                                      │
+│  Guidance (optional)                                 │
+│  ┌────────────────────────────────────────────────┐ │
+│  │ Focus on the backend token logic, not the UI   │ │
+│  └────────────────────────────────────────────────┘ │
+│  (Hint to steer Claude's analysis)                   │
+│                                                      │
+│                               [Cancel] [Generate]    │
+└──────────────────────────────────────────────────────┘
+```
+
+After clicking [Generate], the issue card shows a planning indicator:
+
+```
+│  ◆ Generating tasks...  [View Logs]                               │
+```
+
+**Step 2: Review** — When the plan task completes, suggestions appear inline on the issue card:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  #42  Fix auth token refresh                        bug  high  │
+│  ● in_progress · synced from GitHub · 2 tasks                  │
+│                                                                 │
+│  ┌─ Suggestions from Claude (plan_task_p1l2) ───────────────┐  │
+│  │                                                           │  │
+│  │  1. Implement token refresh middleware                    │  │
+│  │     Add automatic token refresh to                        │  │
+│  │     src/middleware/auth.ts. The current                    │  │
+│  │     implementation in src/auth.ts:45-78...                │  │
+│  │     [Edit] [Approve] [Reject]                             │  │
+│  │                                                           │  │
+│  │  2. Add refresh token endpoint                            │  │
+│  │     Create POST /api/auth/refresh endpoint                │  │
+│  │     in src/routes/auth.ts that accepts...                 │  │
+│  │     [Edit] [Approve] [Reject]                             │  │
+│  │                                                           │  │
+│  │  3. Add token refresh tests                               │  │
+│  │     Add tests for the token refresh flow                  │  │
+│  │     in tests/auth.test.ts covering:                       │  │
+│  │     expired token, refresh success...                     │  │
+│  │     [Edit] [Approve] [Reject]                             │  │
+│  │                                                           │  │
+│  │  [Approve All]  [Dispatch Approved (2)]  [Re-generate]    │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│  Tasks:                                                        │
+│  └─ (none dispatched yet)                                      │
+│                                                                 │
+│  [Generate Tasks]  [+ Manual Task]  [Close]  [GitHub ↗]        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Suggestion states:**
+- `pending` — Default. Shown with neutral styling.
+- `approved` — Green check. Ready to dispatch.
+- `rejected` — Grayed out with strikethrough. Hidden by default (toggle to show).
+- `dispatched` — Shows linked task ID and status. Read-only.
+
+**[Edit]** opens the suggestion prompt in an inline editor (textarea replaces the preview). The user can rewrite Claude's suggested prompt before approving.
+
+**[Dispatch Approved]** creates execute tasks for all approved suggestions and dispatches them to runners. Button shows count: "Dispatch Approved (2)".
+
+**[Re-generate]** runs a new plan task. Previous suggestions stay (can be rejected). New suggestions are appended.
+
+### Manual Task Creation
+
+Clicking **[+ Manual Task]** opens a modal for writing a custom prompt:
 
 ```
 ┌──────────────────────────────────────────────────────┐
@@ -385,7 +542,7 @@ Clicking **[+ Create Task]** on an issue opens a modal:
 └──────────────────────────────────────────────────────┘
 ```
 
-The prompt textarea is pre-filled with the issue title + body (truncated). The user can edit before dispatching.
+This bypasses the plan step — for when the user already knows exactly what to ask Claude to do.
 
 ### Create Issue Modal
 
@@ -412,7 +569,7 @@ The prompt textarea is pre-filled with the issue title + body (truncated). The u
 │  [auth, backend                                ]    │
 │                                                      │
 │  [ ] Also create on forge (GitHub/GitLab/Forgejo)    │
-│  [ ] Immediately create a task for this issue        │
+│  [ ] Immediately generate tasks using Claude          │
 │                                                      │
 │                               [Cancel] [Create]      │
 └──────────────────────────────────────────────────────┘
@@ -435,10 +592,14 @@ Changing a filter updates the URL and re-fetches.
 **API calls:**
 - `GET /projects` — project dropdown
 - `GET /projects/:id/issues?status=&type=&priority=` — issue list (15s refresh)
-- `GET /issues/:id` — issue detail with tasks
+- `GET /issues/:id` — issue detail with tasks and suggestions
 - `POST /projects/:id/issues` — create issue
 - `PATCH /issues/:id` — update issue (close, reopen, change priority)
-- `POST /issues/:id/tasks` — create task for issue
+- `POST /issues/:id/tasks` — create manual task for issue
+- `POST /issues/:id/generate` — generate task suggestions via Claude plan task
+- `GET /issues/:id/suggestions` — list generated suggestions
+- `PATCH /issues/:id/suggestions/:sugId` — edit/approve/reject a suggestion
+- `POST /issues/:id/suggestions/dispatch` — dispatch approved suggestions as execute tasks
 - `POST /projects/:id/sync` — sync issues from forge
 
 ## Shared Components
@@ -565,6 +726,7 @@ New/changed endpoints the UI depends on:
 |----------|---------|---------|
 | `GET /tasks` | Tasks, Board | Task list with project/issue references |
 | `POST /task` | Tasks, Board | Create task (gains `projectId`, `issueId`) |
+| `PATCH /task/:id` | Board | Manual status change / re-queue |
 | `POST /task/:id/cancel` | Board | Cancel a queued/running task |
 | `GET /task/:id/logs` | Tasks, Board | Log content for viewer |
 | `GET /projects` | Projects, Tasks, Issues | Project list |
@@ -573,10 +735,14 @@ New/changed endpoints the UI depends on:
 | `PATCH /projects/:id` | Projects | Update project settings |
 | `POST /projects/:id/sync` | Projects, Issues | Sync issues from forge |
 | `GET /projects/:id/issues` | Issues | Issue list (with filters) |
-| `GET /issues/:id` | Issues | Issue detail with tasks |
+| `GET /issues/:id` | Issues | Issue detail with tasks + suggestions |
 | `POST /projects/:id/issues` | Issues | Create issue |
 | `PATCH /issues/:id` | Issues | Update issue |
-| `POST /issues/:id/tasks` | Issues | Create task for issue |
+| `POST /issues/:id/tasks` | Issues | Create manual task for issue |
+| `POST /issues/:id/generate` | Issues | Generate task suggestions via Claude |
+| `GET /issues/:id/suggestions` | Issues | List generated suggestions |
+| `PATCH /issues/:id/suggestions/:id` | Issues | Edit/approve/reject suggestion |
+| `POST /issues/:id/suggestions/dispatch` | Issues | Dispatch approved suggestions as tasks |
 | `GET /runners` | Board | Runner list for filter |
 
 ### Updated `GET /tasks` Response
@@ -588,6 +754,7 @@ Tasks now include project and issue context:
   {
     "id": "task_a1b2",
     "prompt": "Fix auth token refresh",
+    "type": "execute",
     "status": "running",
     "runnerId": "runner-abc",
     "projectId": "proj_x1",

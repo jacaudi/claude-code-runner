@@ -456,6 +456,288 @@ This is the primary way to dispatch work. The Controller:
 4. Sends `ExecuteTaskRequest` with `project_context` including issue info
 5. Runner creates a PR that references the issue
 
+### `POST /issues/:id/generate` — Generate tasks from an issue using Claude
+
+```json
+// Request
+{
+  "hint": "Focus on the backend token logic, not the UI"  // Optional user guidance
+}
+
+// Response
+{
+  "taskId": "task_p1l2a3n4",
+  "issueId": "iss_e5f6g7h8",
+  "status": "queued",
+  "type": "plan"
+}
+```
+
+This creates a **plan task** — a special Claude execution that analyzes the issue and the codebase, then produces suggested tasks. See [Task Generation from Issues](#task-generation-from-issues) for the full workflow.
+
+### `GET /issues/:id/suggestions` — List generated task suggestions
+
+```json
+[
+  {
+    "id": "sug_m1n2o3",
+    "planTaskId": "task_p1l2a3n4",
+    "title": "Implement token refresh middleware",
+    "prompt": "Add automatic token refresh to src/middleware/auth.ts...",
+    "status": "pending",
+    "order": 1
+  },
+  {
+    "id": "sug_p4q5r6",
+    "planTaskId": "task_p1l2a3n4",
+    "title": "Add refresh token endpoint",
+    "prompt": "Create POST /api/auth/refresh that accepts...",
+    "status": "pending",
+    "order": 2
+  }
+]
+```
+
+### `PATCH /issues/:id/suggestions/:sugId` — Edit a suggestion
+
+```json
+// Request
+{
+  "prompt": "Updated prompt text...",
+  "status": "approved"    // "approved" | "rejected" | "pending"
+}
+```
+
+### `POST /issues/:id/suggestions/dispatch` — Dispatch approved suggestions as tasks
+
+```json
+// Request
+{
+  "suggestionIds": ["sug_m1n2o3", "sug_p4q5r6"]   // optional; omit to dispatch all approved
+}
+
+// Response
+{
+  "dispatched": [
+    {"suggestionId": "sug_m1n2o3", "taskId": "task_x7y8z9"},
+    {"suggestionId": "sug_p4q5r6", "taskId": "task_a0b1c2"}
+  ]
+}
+```
+
+## Task Types
+
+Tasks have a `type` field that determines their behavior:
+
+| Type | Purpose | Modifies Code? | Produces |
+|------|---------|---------------|----------|
+| `execute` | Default. Implements work, creates PR. | Yes | PR, commits, artifacts |
+| `plan` | Analyzes issue + codebase, suggests tasks. | No (read-only worktree) | Task suggestions (JSON artifact) |
+
+The `plan` type is the engine behind the "Generate Tasks" feature. It gives Claude full codebase access via a worktree but instructs it to produce analysis and suggestions rather than code changes.
+
+## Task Generation from Issues
+
+### The Problem
+
+Manually writing task prompts requires the user to already understand the codebase well enough to describe exactly what Claude should do. For many issues — especially synced from a forge — the issue body is a high-level description ("tokens expire after 1 hour") that needs translation into specific, actionable implementation steps.
+
+### The Solution: Plan Tasks
+
+A **plan task** is a Claude execution that reads the issue context, explores the codebase, and produces a structured set of task suggestions. The user reviews, edits, and approves the suggestions before they become real tasks.
+
+```
+Issue #42: "Fix auth token refresh"
+  │
+  ├─ User clicks [Generate Tasks]
+  │
+  ├─ Controller creates plan task (type: "plan")
+  │    → Mounts worktree (read-only analysis)
+  │    → System prompt instructs: read issue, explore codebase,
+  │      output structured suggestions (no code changes)
+  │
+  ├─ Claude explores: reads src/auth.ts, finds refresh logic,
+  │   checks test coverage, identifies dependencies
+  │
+  ├─ Claude outputs suggestions artifact:
+  │    [
+  │      { title: "Implement token refresh middleware",
+  │        prompt: "Add automatic token refresh to src/middleware/auth.ts.
+  │                 The current implementation in src/auth.ts:45-78 expires
+  │                 tokens but never refreshes them. Add a middleware that
+  │                 checks token expiry 5 min before and calls the refresh
+  │                 endpoint...",
+  │        order: 1 },
+  │      { title: "Add refresh token endpoint",
+  │        prompt: "Create POST /api/auth/refresh endpoint in
+  │                 src/routes/auth.ts that accepts a refresh token...",
+  │        order: 2 },
+  │      { title: "Add token refresh tests",
+  │        prompt: "Add tests for the token refresh flow in
+  │                 tests/auth.test.ts covering: expired token,
+  │                 refresh success, refresh failure, concurrent...",
+  │        order: 3 }
+  │    ]
+  │
+  ├─ Controller parses suggestions → inserts into task_suggestions table
+  │
+  ├─ UI shows suggestions on issue card with [Edit] [Approve] [Reject]
+  │
+  ├─ User reviews, edits prompts, approves 2 of 3
+  │
+  └─ User clicks [Dispatch Approved] → 2 execute tasks created
+```
+
+### Plan Task System Prompt
+
+The plan task gets a specialized system prompt that differs from the normal worker:
+
+```
+You are analyzing an issue to break it down into implementable tasks.
+
+Issue: {{issue_title}}
+Issue #{{issue_number}}: {{issue_body}}
+Project: {{project_name}} ({{forge_type}})
+
+Your job:
+1. Read and understand the issue
+2. Explore the codebase to understand the current implementation
+3. Identify what needs to change and where
+4. Break the work into discrete, independently-executable tasks
+5. For each task, write a detailed prompt that another Claude instance
+   can follow without needing to re-discover what you found
+
+Rules:
+- Do NOT modify any files. This is read-only analysis.
+- Do NOT create branches or commits.
+- Each suggested task should be independently executable (own branch, own PR).
+- Order tasks by dependency (if task B depends on task A, A comes first).
+- Be specific: reference exact file paths, line numbers, function names.
+- Include context that the implementing Claude would need to discover.
+
+Output your suggestions by creating the file:
+  .claude/plans/suggestions.json
+
+Format:
+[
+  {
+    "title": "Short title for the task",
+    "prompt": "Detailed prompt for the implementing Claude...",
+    "order": 1
+  }
+]
+```
+
+### Suggestions Schema
+
+```sql
+CREATE TABLE task_suggestions (
+  id              TEXT PRIMARY KEY,         -- "sug_m1n2o3p4"
+  issue_id        TEXT NOT NULL REFERENCES issues(id),
+  plan_task_id    TEXT NOT NULL REFERENCES tasks(id),
+  title           TEXT NOT NULL,            -- Short title
+  prompt          TEXT NOT NULL,            -- Full task prompt (editable)
+  original_prompt TEXT NOT NULL,            -- Original Claude-generated prompt (immutable)
+  status          TEXT DEFAULT 'pending',   -- "pending" | "approved" | "rejected" | "dispatched"
+  task_id         TEXT REFERENCES tasks(id),-- Set when dispatched as an execute task
+  sort_order      INTEGER DEFAULT 0,
+  created_at      TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_suggestions_issue ON task_suggestions(issue_id);
+CREATE INDEX idx_suggestions_plan_task ON task_suggestions(plan_task_id);
+```
+
+### Updated Tasks Schema
+
+```sql
+-- Tasks: individual Claude executions (updated)
+CREATE TABLE tasks (
+  id              TEXT PRIMARY KEY,
+  project_id      TEXT REFERENCES projects(id),
+  issue_id        TEXT REFERENCES issues(id),
+  prompt          TEXT NOT NULL,
+  type            TEXT DEFAULT 'execute',   -- "execute" | "plan"  ← NEW
+  status          TEXT DEFAULT 'queued',    -- "queued" | "running" | "completed" | "failed"
+  runner_id       TEXT,
+  branch_name     TEXT,
+  worktree_path   TEXT,
+  pr_url          TEXT,
+  error           TEXT,
+  error_type      TEXT,
+  started_at      TEXT,
+  finished_at     TEXT,
+  created_at      TEXT DEFAULT (datetime('now'))
+);
+```
+
+### Plan Task Execution Flow
+
+```
+POST /issues/:id/generate {hint?}
+  │
+  ├─ Controller: create task record
+  │    {project_id, issue_id, type: 'plan', status: 'queued',
+  │     prompt: <generated from issue + hint>}
+  │
+  ├─ Controller: projectManager.createWorktree(projectId, taskId)
+  │    → git fetch origin
+  │    → git worktree add ... -b claude/plan-task_abc origin/main
+  │
+  ├─ Controller: taskRouter.route(taskId)
+  │
+  ├─ Controller: runner.grpcClient.ExecuteTask({
+  │    task_id, prompt: <plan system prompt + issue context>,
+  │    config_files,
+  │    project_context: { ..., task_type: "plan" }
+  │  })
+  │
+  ├─ Runner: (NO orchestrator phase)
+  │    → cwd = /workspace (mounted worktree)
+  │    → plan phase only (special system prompt, read-only intent)
+  │    → Claude explores codebase, writes .claude/plans/suggestions.json
+  │    → artifact collector picks up suggestions.json
+  │    → streams ARTIFACT{type: SUGGESTION} back
+  │
+  ├─ Controller: receives SUGGESTION artifact
+  │    → parses JSON array of {title, prompt, order}
+  │    → inserts into task_suggestions table
+  │    → marks plan task as completed
+  │
+  └─ Controller: projectManager.removeWorktree(projectId, taskId)
+```
+
+### Dispatching Approved Suggestions
+
+When the user approves suggestions and clicks "Dispatch":
+
+```
+POST /issues/:id/suggestions/dispatch
+  │
+  ├─ For each approved suggestion:
+  │    ├─ Create execute task record
+  │    │    {project_id, issue_id, type: 'execute', prompt: suggestion.prompt}
+  │    ├─ Update suggestion: status='dispatched', task_id=<new task id>
+  │    ├─ Create worktree for the task
+  │    └─ Route to runner (normal execute flow)
+  │
+  └─ Return list of created tasks
+```
+
+Suggestions can be dispatched one at a time or in batch. They execute independently (separate branches, separate PRs).
+
+### Re-generation
+
+If the user isn't satisfied with the suggestions, they can:
+1. Click [Generate Tasks] again on the same issue
+2. A new plan task runs with fresh analysis
+3. Previous suggestions remain (status unchanged) — new ones are appended
+4. User can reject old suggestions and approve new ones
+
+The optional `hint` field on `POST /issues/:id/generate` lets the user guide the planning:
+- `"Focus on the backend only, ignore UI changes"`
+- `"Break this into smaller incremental PRs"`
+- `"Include tests for each task"`
+
 ## Updated Task Flow (Project Mode)
 
 ```
@@ -597,7 +879,9 @@ Insert these steps after step 8 (artifact HTTP API) and before step 9 (RunnerPoo
 
 **8e. Add project_context to task dispatch** — When a task has a `project_id`, Controller creates worktree, mounts it into Runner, sends `ProjectContext` in proto. Runner skips orchestrator.
 
-**8f. Add GitLab + Forgejo forge implementations** — Extend forge layer.
+**8f. Add task generation (plan tasks)** — `POST /issues/:id/generate` creates a plan task. Runner gets a read-only worktree and a specialized system prompt. Suggestion artifact parsed into `task_suggestions` table. Review/approve/dispatch UI on the issues view.
+
+**8g. Add GitLab + Forgejo forge implementations** — Extend forge layer.
 
 ## Known Challenges
 
@@ -616,3 +900,7 @@ Insert these steps after step 8 (artifact HTTP API) and before step 9 (RunnerPoo
 **19. Worktree + Runner mount timing** — The worktree must be created before the Runner container starts (it's a bind mount). If worktree creation fails (disk full, git error), the task should fail immediately with `error_type: 'worktree_error'` rather than dispatching to a runner.
 
 **20. Concurrent fetches on same bare repo** — If two tasks for the same project start simultaneously, both try to `git fetch origin`. This is safe (git handles concurrent fetches), but may be slow. Consider a per-project fetch lock or a background fetch scheduler.
+
+**21. Plan task cost** — Each "Generate Tasks" invocation runs a full Claude session (worktree mount, codebase exploration, analysis). For large repos this can take several minutes and consume significant API credits. The UI should make it clear this is a billable operation, not a free preview. Consider caching: if the issue hasn't changed and the codebase is the same (same HEAD), offer to show the previous suggestions instead of re-generating.
+
+**22. Suggestion ordering and dependencies** — Claude may suggest tasks in dependency order (task 2 depends on task 1). Currently, dispatching creates independent tasks with no ordering guarantee. If order matters, the user should dispatch one at a time, waiting for each to complete. Future: add a `depends_on` field to suggestions and serial dispatch mode.

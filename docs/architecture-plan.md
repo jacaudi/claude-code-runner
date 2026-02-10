@@ -1153,3 +1153,9 @@ All via environment variables:
 11. **Artifact diffing accuracy** — The artifact collector compares filesystem state before and after the worker runs. Files modified by git operations (checkout, merge) should not be treated as artifacts. The collector only scans `.claude/plans/`, `.claude/rules/`, and `.claude/skills/` directories — not the entire repo — to avoid false positives.
 
 12. **Promoting artifacts as configs** — When a user promotes an artifact to a config, the Controller must validate the content (is it valid markdown? valid JSON for MCP?) before persisting. Invalid configs could break future task executions.
+
+13. **Plan task read-only enforcement** — Plan tasks are intended for read-only codebase analysis, but Claude Code has full filesystem access. The system prompt instructs "do not modify files" but cannot enforce it. Mitigation: mount the worktree as `:ro` for plan tasks, or run a post-task check that verifies no commits were created.
+
+14. **Suggestion parsing reliability** — Plan tasks output suggestions as `.claude/plans/suggestions.json`. If Claude produces malformed JSON or writes to a different path, the Controller gets no suggestions. Mitigation: also scan Claude's text output for JSON blocks as a fallback, and show a "No suggestions generated — try re-generating with a hint" message.
+
+15. **Manual re-queue creates new tasks** — When a user drags a completed/failed task back to Queued on the Kanban board, the Controller creates a new task (preserving the original). This prevents history loss but means the issue may accumulate many task records. The UI should group retries and show "Retry #2 of task_abc" to keep the view clean.

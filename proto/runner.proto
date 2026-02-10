@@ -58,6 +58,7 @@ enum ArtifactType {
   ARTIFACT_TYPE_RULE = 1;
   ARTIFACT_TYPE_SKILL = 2;
   ARTIFACT_TYPE_OTHER = 3;
+  ARTIFACT_TYPE_SUGGESTION = 4;  // Task suggestions JSON from plan tasks
 }
 
 // ============ Project Context ============
@@ -76,6 +77,10 @@ message ProjectContext {
   string issue_number = 6;     // Forge issue number, for PR cross-references
   string issue_title = 7;      // For commit messages and PR titles
   string issue_url = 8;        // Full URL for linking in PR body
+  string issue_body = 9;       // Full issue description (for plan tasks)
+
+  // Task behavior
+  string task_type = 10;       // "execute" (default) | "plan" (read-only analysis, produces suggestions)
 }
 
 // ============ ExecuteTask ============
