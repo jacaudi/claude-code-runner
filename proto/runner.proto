@@ -1,0 +1,73 @@
+syntax = "proto3";
+
+package clauderunner;
+
+// The Runner service, called by the Controller.
+service RunnerService {
+  // Execute a task (orchestrator + worker phases).
+  // Returns a server-side stream of TaskEvent messages covering
+  // status transitions, log lines, and final results.
+  rpc ExecuteTask(ExecuteTaskRequest) returns (stream TaskEvent);
+
+  // Cancel a running task.
+  rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
+
+  // Health check -- lets the Controller verify the Runner is alive.
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+// ============ ExecuteTask ============
+
+message ExecuteTaskRequest {
+  string task_id = 1;            // Controller-assigned ID (e.g. "a1b2c3d4")
+  string prompt = 2;             // User's task prompt
+  string github_token = 3;      // Forwarded from Controller
+  string anthropic_api_key = 4; // Optional, may be empty
+}
+
+message TaskEvent {
+  string task_id = 1;
+  TaskEventType type = 2;
+
+  // Exactly one of the following is populated depending on `type`.
+  string log_line = 3;           // for LOG
+  TaskStatus status_update = 4;  // for STATUS_CHANGE
+  TaskResult result = 5;         // for RESULT (terminal)
+}
+
+enum TaskEventType {
+  LOG = 0;
+  STATUS_CHANGE = 1;
+  RESULT = 2;
+}
+
+message TaskStatus {
+  string status = 1;  // "running", "orchestrator", "worker"
+  string phase = 2;   // "orchestrator" | "worker" | ""
+}
+
+message TaskResult {
+  bool success = 1;
+  string error_message = 2;  // empty on success
+  string error_type = 3;     // "timeout" | "exit_code" | "auth_expired" | "capacity_reached" | ""
+  string pr_url = 4;         // extracted PR URL, empty if not found
+}
+
+// ============ CancelTask ============
+
+message CancelTaskRequest {
+  string task_id = 1;
+}
+
+message CancelTaskResponse {
+  bool acknowledged = 1;
+}
+
+// ============ HealthCheck ============
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool ok = 1;
+  int32 running_tasks = 2;
+}
