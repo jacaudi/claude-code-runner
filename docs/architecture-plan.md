@@ -18,6 +18,8 @@ Communication: gRPC over per-runner Unix domain sockets in a shared bind-mount d
 
 The system supports **Projects** (registered git repos on GitHub, Forgejo, or GitLab) with **Issues** (bugs, features, dependency updates) that decompose into Tasks. See [Projects and Issues](./projects-and-issues.md) for the full design.
 
+The Controller serves a single-page dashboard with four views: Tasks (one-off submission + table), Board (Kanban columns by status), Projects (registration + management), and Issues (list, sync from forge, task creation). See [UI Design](./ui-design.md) for the full design.
+
 ## Architecture Diagram
 
 ```
@@ -127,9 +129,19 @@ claude-code-runner/
 │   │   │   ├── gitlab.js               # GitLab (Gitbeaker)
 │   │   │   └── forgejo.js              # Forgejo (Octokit + custom auth)
 │   │   └── static/
-│   │       ├── dashboard.html
-│   │       ├── login.html
-│   │       └── setup.html
+│   │       ├── index.html           # SPA shell: nav, auth, hash router
+│   │       ├── app.css              # All styles (dark theme, kanban, cards)
+│   │       ├── views/
+│   │       │   ├── tasks.js         # Tasks view (submit + table)
+│   │       │   ├── board.js         # Kanban board (4 columns)
+│   │       │   ├── projects.js      # Project registration + list
+│   │       │   └── issues.js        # Issue list + detail + task creation
+│   │       ├── components/
+│   │       │   ├── task-card.js     # Task card (shared by board + task detail)
+│   │       │   ├── log-viewer.js    # Log modal (extracted from old dashboard)
+│   │       │   └── forms.js         # Modal forms, validation helpers
+│   │       ├── login.html           # Pre-auth (standalone, no SPA)
+│   │       └── setup.html           # First-run setup (standalone)
 │   ├── runner/
 │   │   ├── server.js                    # gRPC server, task management
 │   │   ├── executor.js                  # Orchestrator + Worker phase execution
@@ -1078,9 +1090,17 @@ CMD ["node", "src/runner/server.js"]
 
 17. **Add GitLab + Forgejo forge implementations** — Complete multi-forge support.
 
-18. **Docker split** — `Dockerfile.controller`, `Dockerfile.runner`, updated `docker-compose.yml`.
+18. **Refactor dashboard into SPA** — Extract `dashboard.html` into `index.html` shell + `app.css` + `views/tasks.js` + `components/log-viewer.js`. Hash router. Same functionality, modular code.
 
-19. **Remove monolith** — Delete `src/server.js`.
+19. **Add Kanban board view** — `views/board.js`. Four-column layout (Queued, Running, Completed, Failed). Task cards with status colors, cancel button, log viewer.
+
+20. **Add Projects view** — `views/projects.js`. Register project modal with forge auto-detection. Project cards with issue counts, sync button, settings.
+
+21. **Add Issues view** — `views/issues.js`. Filterable issue list with collapsible cards. Create-task-from-issue modal with pre-filled prompt. Issue creation with forge sync.
+
+22. **Docker split** — `Dockerfile.controller`, `Dockerfile.runner`, updated `docker-compose.yml`.
+
+23. **Remove monolith** — Delete `src/server.js`.
 
 ## Configuration
 
