@@ -30,22 +30,37 @@ Communication: gRPC over per-runner Unix domain sockets in a shared bind-mount d
    POST /runners        │  Task router            │ idle reaper      │    │
    GET  /runners        │                         └────────┬────────┘    │
    DELETE /runners/:id  │                                  │ Docker API   │
-                        └──────────┬───────────────────────┼─────────────┘
-                                   │                       │
-                          gRPC over UDS                    │ /var/run/docker.sock
-                          /var/run/claude-runners/         │
-                          runner-{id}.sock                 │
-                                   │                       │
-              ┌────────────────────┼───────────────────────┼──────────┐
-              │                    │                       ▼          │
+                        │  Config store (skills,  │        │              │
+   POST /configs        │   rules, MCP, plans)    │        │              │
+   GET  /configs        │  Artifact store          │        │              │
+   GET  /task/:id/      │   (per-task outputs)    │        │              │
+       artifacts        │                         │        │              │
+                        └──────────┬──────────────┼────────┼─────────────┘
+                                   │              │        │
+                          gRPC over UDS           │        │ /var/run/docker.sock
+                          /var/run/claude-runners/ │        │
+                          runner-{id}.sock         │        │
+                                   │              │        │
+                           ┌───────┴──────┐       │        │
+                           │  ConfigFiles │       │        │
+                           │  ──────────► │       │        │
+                           │  (in request)│       │        │
+                           │              │       │        │
+                           │  Artifacts   │       │        │
+                           │  ◄────────── │       │        │
+                           │  (in stream) │       │        │
+                           └───────┬──────┘       │        │
+                                   │              │        │
+              ┌────────────────────┼──────────────┼────────┼──────────┐
+              │                    │              │        ▼          │
               │    ┌───────────────┴──────────────┐   Docker Engine   │
               │    │         RUNNER (container)    │                  │
               │    │                               │                  │
               │    │  gRPC server (RunnerService)  │    ┌──────────┐ │
-              │    │  Task executor (node-pty)     │    │ Runner 2 │ │
-              │    │  Orchestrator + Worker phases │    └──────────┘ │
-              │    │  System prompts              │    ┌──────────┐ │
-              │    │                               │    │ Runner N │ │
+              │    │  Config deployer              │    │ Runner 2 │ │
+              │    │  Task executor (node-pty)     │    └──────────┘ │
+              │    │  Artifact collector           │    ┌──────────┐ │
+              │    │  System prompts              │    │ Runner N │ │
               │    └───────────────────────────────┘    └──────────┘ │
               │                                                      │
               │                     Docker Host                      │
@@ -75,12 +90,19 @@ See `proto/runner.proto`. Four RPCs on `RunnerService`:
 
 | RPC | Type | Purpose |
 |-----|------|---------|
-| `ExecuteTask` | Server-streaming | Full task lifecycle — logs, status changes, and final result as `TaskEvent` stream |
+| `ExecuteTask` | Server-streaming | Full task lifecycle. Request carries config files (skills, rules, MCP, plans). Stream carries logs, status, **artifacts**, and result. |
 | `CancelTask` | Unary | Kill a running task via `AbortController` |
 | `HealthCheck` | Unary | Verify Runner is alive, get running/max task counts, runner ID |
 | `Drain` | Unary | Stop accepting new tasks, finish current ones. Used before teardown. |
 
-The proto only defines the Runner-side service. Runner management (create, destroy, list) is internal to the Controller and exposed via HTTP API — no proto needed for that.
+Key proto messages for config sharing:
+
+| Message | Direction | Purpose |
+|---------|-----------|---------|
+| `ConfigFile` | Controller → Runner | A file (skill, rule, MCP config, plan) sent in `ExecuteTaskRequest.config_files` |
+| `Artifact` | Runner → Controller | A file produced during execution, streamed back as `TaskEvent{type:ARTIFACT}` |
+
+The proto only defines the Runner-side service. Runner management and config storage are internal to the Controller and exposed via HTTP API.
 
 ## Directory Structure
 
@@ -93,6 +115,7 @@ claude-code-runner/
 │   │   ├── server.js                    # Express app, auth, routes, startup
 │   │   ├── runner-pool.js               # Runner lifecycle: create, destroy, health, reap
 │   │   ├── task-router.js               # Decide which Runner gets a task
+│   │   ├── config-store.js              # Config file storage + retrieval (skills, rules, MCP, plans)
 │   │   └── static/
 │   │       ├── dashboard.html
 │   │       ├── login.html
@@ -100,6 +123,8 @@ claude-code-runner/
 │   ├── runner/
 │   │   ├── server.js                    # gRPC server, task management
 │   │   ├── executor.js                  # Orchestrator + Worker phase execution
+│   │   ├── config-deployer.js           # Write config files to filesystem before Claude runs
+│   │   ├── artifact-collector.js        # Scan for plans/artifacts after Claude finishes
 │   │   └── prompts.js                   # System prompt generators
 │   └── shared/
 │       ├── grpc-client.js               # gRPC client factory with UDS + keepalive config
@@ -225,6 +250,374 @@ await container.start();
 
 The Runner container's entrypoint (`node src/runner/server.js`) reads `RUNNER_SOCKET` and starts a gRPC server on that path.
 
+## Config Sharing: Controller → Runner
+
+The Controller stores a library of configuration files (skills, MCP configs, rules, plans) and sends them to the Runner as part of each `ExecuteTaskRequest`. The Runner deploys them to the correct filesystem locations before spawning Claude.
+
+### What Gets Shared
+
+| Config Type | Claude Code Discovery Path | Format | Scope |
+|-------------|---------------------------|--------|-------|
+| **Skills** | `.claude/skills/<name>/SKILL.md` | YAML frontmatter + Markdown | Project or User |
+| **MCP configs** | `.mcp.json` (project root) | JSON (`{mcpServers: {...}}`) | Project |
+| **Rules** | `.claude/rules/*.md`, `.claude/CLAUDE.md` | Markdown (optional YAML frontmatter for path conditions) | Project or User |
+| **Plans** | `.claude/plans/*.md` (configurable) | Plain Markdown | User (default) |
+
+### Controller Config Store (`src/controller/config-store.js`)
+
+The Controller persists config files on disk at `/data/configs/` and loads them into memory on startup.
+
+```
+/data/configs/
+├── skills/
+│   └── review/
+│       └── SKILL.md            # Skill: /review slash command
+├── rules/
+│   ├── security.md             # Rule: security guidelines
+│   └── code-style.md           # Rule: formatting conventions
+├── mcp/
+│   └── default.json            # MCP server config
+└── plans/
+    └── refactor-strategy.md    # Shared plan template
+```
+
+Each config file is stored with metadata:
+
+```javascript
+// Config entry shape in the store
+{
+  id: string,          // e.g. "cfg_a1b2c3d4"
+  name: string,        // Human-readable name: "security-rules"
+  type: 'skill' | 'mcp' | 'rule' | 'plan',
+  scope: 'project' | 'user',
+  path: string,        // Relative path: "rules/security.md"
+  content: Buffer,     // Raw file content
+  createdAt: Date,
+  updatedAt: Date,
+}
+```
+
+### HTTP API: Config Management
+
+#### `POST /configs` — Upload a config file
+
+```json
+// Request
+{
+  "name": "security-rules",
+  "type": "rule",
+  "scope": "project",
+  "path": "rules/security.md",
+  "content": "# Security Rules\n\n- Never commit secrets..."
+}
+
+// Response
+{
+  "id": "cfg_a1b2c3d4",
+  "name": "security-rules",
+  "type": "rule",
+  "scope": "project",
+  "path": "rules/security.md",
+  "createdAt": "2026-02-10T12:00:00Z"
+}
+```
+
+#### `GET /configs` — List all configs
+
+```json
+[
+  {
+    "id": "cfg_a1b2c3d4",
+    "name": "security-rules",
+    "type": "rule",
+    "scope": "project",
+    "path": "rules/security.md",
+    "size": 1234,
+    "createdAt": "2026-02-10T12:00:00Z",
+    "updatedAt": "2026-02-10T12:00:00Z"
+  }
+]
+```
+
+Optional query params: `?type=rule`, `?scope=project`
+
+#### `GET /configs/:id` — Get config with content
+
+Returns the full config entry including content.
+
+#### `PUT /configs/:id` — Update a config
+
+```json
+{
+  "content": "# Updated Security Rules\n\n- Never commit secrets..."
+}
+```
+
+#### `DELETE /configs/:id` — Remove a config
+
+### `POST /task` — Updated with config overrides
+
+```json
+{
+  "prompt": "Add dark mode to the dashboard",
+  "runnerId": "abc123",
+  "configIds": ["cfg_a1b2c3d4", "cfg_e5f6g7h8"],
+  "extraConfigs": [
+    {
+      "type": "rule",
+      "scope": "project",
+      "path": "rules/task-specific.md",
+      "content": "# For This Task\n\nUse Tailwind CSS..."
+    }
+  ]
+}
+```
+
+Config resolution for a task:
+
+1. Start with all configs in the store (the "default set")
+2. If `configIds` is provided, use **only those** instead of the default set
+3. Merge in any `extraConfigs` (task-specific overrides, applied last)
+
+### Runner Config Deployer (`src/runner/config-deployer.js`)
+
+When the Runner receives an `ExecuteTaskRequest` with `config_files`, it writes them to disk before spawning Claude. The deployment path depends on `scope` and `type`:
+
+```javascript
+// src/runner/config-deployer.js
+
+const HOME_CLAUDE = '/home/node/.claude';
+
+export async function deployConfigs(configFiles, repoDir) {
+  for (const cfg of configFiles) {
+    const targetPath = resolveTargetPath(cfg, repoDir);
+    await mkdir(path.dirname(targetPath), { recursive: true });
+    await writeFile(targetPath, cfg.content);
+  }
+}
+
+function resolveTargetPath(cfg, repoDir) {
+  const base = cfg.scope === 1 /* USER */ ? HOME_CLAUDE : repoDir;
+
+  switch (cfg.type) {
+    case 0: // SKILL -> .claude/skills/<path>
+      return path.join(base, '.claude', 'skills', cfg.path);
+
+    case 1: // MCP -> .mcp.json at project root, or settings.local.json for user
+      if (cfg.scope === 1) {
+        return path.join(HOME_CLAUDE, 'settings.local.json');
+      }
+      return path.join(base, '.mcp.json');
+
+    case 2: // RULE -> .claude/rules/<path> or .claude/CLAUDE.md
+      if (cfg.path === 'CLAUDE.md') {
+        return path.join(base, '.claude', 'CLAUDE.md');
+      }
+      return path.join(base, '.claude', 'rules', cfg.path);
+
+    case 3: // PLAN -> .claude/plans/<path>
+      return path.join(base, '.claude', 'plans', cfg.path);
+
+    case 4: // OTHER -> exact path
+      return path.join(base, cfg.path);
+  }
+}
+```
+
+**Deployment timing**: Configs are deployed in two phases:
+- **User-scoped configs** (`CONFIG_SCOPE_USER`): Deployed immediately when `ExecuteTask` is received, before the orchestrator phase. These go into `~/.claude/` and apply to all Claude invocations.
+- **Project-scoped configs** (`CONFIG_SCOPE_PROJECT`): Deployed after the orchestrator phase clones the repo but before the worker phase. The Runner writes them into the cloned repo directory so the worker Claude picks them up.
+
+### Deployment Sequence
+
+```
+ExecuteTaskRequest received (with config_files)
+  │
+  ├─ Deploy USER-scoped configs to ~/.claude/
+  │   └─ ~/.claude/rules/*.md, ~/.claude/skills/*, ~/.claude/plans/*
+  │
+  ├─ Run Orchestrator phase (clones repo, creates branch)
+  │
+  ├─ Deploy PROJECT-scoped configs to <repo>/
+  │   └─ <repo>/.claude/rules/*.md, <repo>/.mcp.json, <repo>/.claude/skills/*
+  │
+  └─ Run Worker phase (Claude discovers all configs automatically)
+```
+
+## Artifact Sharing: Runner → Controller
+
+After the worker phase completes (or between phases), the Runner scans for files created by Claude and streams them back as `ARTIFACT` events.
+
+### What Gets Collected
+
+| Artifact Type | Scan Location | When |
+|---------------|--------------|------|
+| Plans | `~/.claude/plans/`, `<repo>/.claude/plans/` | After worker completes |
+| Rules | `<repo>/.claude/rules/` (new/modified only) | After worker completes |
+| Skills | `<repo>/.claude/skills/` (new/modified only) | After worker completes |
+
+### Runner Artifact Collector (`src/runner/artifact-collector.js`)
+
+```javascript
+// src/runner/artifact-collector.js
+
+export async function collectArtifacts(repoDir, emit, snapshotBefore) {
+  // Compare filesystem state to snapshot taken before worker ran
+  // Only collect NEW or MODIFIED files
+
+  const artifacts = [];
+
+  // 1. Scan plans directory
+  const planDirs = [
+    path.join('/home/node/.claude/plans'),
+    path.join(repoDir, '.claude', 'plans'),
+  ];
+  for (const dir of planDirs) {
+    for (const file of await listMarkdownFiles(dir)) {
+      if (isNewOrModified(file, snapshotBefore)) {
+        artifacts.push({
+          path: path.relative(repoDir, file.path),
+          content: await readFile(file.path),
+          type: 0, // PLAN
+        });
+      }
+    }
+  }
+
+  // 2. Scan rules directory (new/modified only)
+  const rulesDir = path.join(repoDir, '.claude', 'rules');
+  for (const file of await listMarkdownFiles(rulesDir)) {
+    if (isNewOrModified(file, snapshotBefore)) {
+      artifacts.push({
+        path: path.relative(repoDir, file.path),
+        content: await readFile(file.path),
+        type: 1, // RULE
+      });
+    }
+  }
+
+  // 3. Scan skills directory (new/modified only)
+  const skillsDir = path.join(repoDir, '.claude', 'skills');
+  for (const file of await listMarkdownFiles(skillsDir)) {
+    if (isNewOrModified(file, snapshotBefore)) {
+      artifacts.push({
+        path: path.relative(repoDir, file.path),
+        content: await readFile(file.path),
+        type: 2, // SKILL
+      });
+    }
+  }
+
+  // Stream each artifact back to Controller
+  for (const artifact of artifacts) {
+    emit('artifact', artifact);
+  }
+
+  return artifacts;
+}
+
+// Take snapshot of .claude/ directory before worker runs
+export async function snapshotConfigDirs(repoDir) {
+  // Returns Map<filePath, { mtime, size }> for diffing later
+}
+```
+
+### Artifact Flow in Executor
+
+```javascript
+// In src/runner/executor.js (updated)
+
+export async function executeTask(taskId, prompt, env, configFiles, emit, signal) {
+  // 1. Deploy user-scoped configs
+  const userConfigs = configFiles.filter(c => c.scope === 1);
+  const projectConfigs = configFiles.filter(c => c.scope === 0);
+  await deployConfigs(userConfigs, null);
+
+  // 2. Run orchestrator (clones repo)
+  emit('status', { status: 'running', phase: 'orchestrator' });
+  await runPhase('orchestrator', ...);
+
+  // 3. Deploy project-scoped configs into cloned repo
+  await deployConfigs(projectConfigs, repoDir);
+
+  // 4. Snapshot .claude/ dirs before worker runs
+  const snapshot = await snapshotConfigDirs(repoDir);
+
+  // 5. Run worker
+  emit('status', { status: 'running', phase: 'worker' });
+  const output = await runPhase('worker', ...);
+
+  // 6. Collect and stream artifacts
+  await collectArtifacts(repoDir, emit, snapshot);
+
+  // 7. Return result
+  return { success: true, ... };
+}
+```
+
+### Controller Artifact Storage
+
+The Controller stores artifacts in memory per task (alongside logs):
+
+```javascript
+// Task entry shape (updated)
+{
+  status: 'running',
+  prompt: '...',
+  logLines: [],
+  artifacts: [           // NEW
+    {
+      path: '.claude/plans/refactor.md',
+      content: Buffer,
+      type: 'plan',
+      receivedAt: '2026-02-10T14:30:00Z'
+    }
+  ],
+  // ... other fields
+}
+```
+
+### HTTP API: Artifact Retrieval
+
+#### `GET /task/:id/artifacts` — List artifacts from a task
+
+```json
+[
+  {
+    "path": ".claude/plans/refactor.md",
+    "type": "plan",
+    "size": 2048,
+    "receivedAt": "2026-02-10T14:30:00Z"
+  }
+]
+```
+
+#### `GET /task/:id/artifacts/*path` — Get artifact content
+
+Returns raw file content with appropriate Content-Type.
+
+#### `POST /task/:id/artifacts/:path/promote` — Save artifact as a config
+
+Takes an artifact produced by a task and saves it into the config store, making it available for future tasks.
+
+```json
+// Request
+{
+  "name": "refactor-plan",
+  "scope": "project"
+}
+
+// Response
+{
+  "configId": "cfg_x9y8z7",
+  "name": "refactor-plan",
+  "type": "plan",
+  "path": "plans/refactor.md"
+}
+```
+
+This is the key feedback loop: Runner creates a plan → Controller receives it as an artifact → User promotes it to a config → Future tasks receive it automatically.
+
 ## Runner Types: Persistent vs Ephemeral
 
 ### Persistent Runners
@@ -337,6 +730,7 @@ Optionally accepts `runnerId` to target a specific runner. Otherwise auto-routes
 User ──POST /task──► Controller
                        │
                        ├─ Create task in Map {status:'queued'}
+                       ├─ Resolve config files (store defaults + configIds + extraConfigs)
                        ├─ Return {id, status:'queued'} immediately
                        │
                        ▼
@@ -353,19 +747,27 @@ User ──POST /task──► Controller
                                           └─ return new runner
                        │
                        ▼
-                   runner.grpcClient.ExecuteTask(request)
+                   runner.grpcClient.ExecuteTask({
+                     task_id, prompt, github_token,
+                     config_files: [skills, rules, mcp, plans]   ◄── configs sent here
+                   })
                        │
                   gRPC stream (unix:///var/run/claude-runners/runner-{id}.sock)
                        │
                        ▼
                    Runner container
                      │
+                     ├─ Deploy USER-scoped configs to ~/.claude/
                      ├─ emit STATUS_CHANGE(running, orchestrator)
                      ├─ spawn claude CLI (orchestrator, 20min timeout)
                      ├─ emit LOG lines
+                     ├─ Deploy PROJECT-scoped configs to <repo>/
+                     ├─ Snapshot .claude/ dirs (for artifact diffing)
                      ├─ emit STATUS_CHANGE(running, worker)
                      ├─ spawn claude CLI (worker, 1hr timeout)
                      ├─ emit LOG lines
+                     ├─ Collect new/modified artifacts (plans, rules, skills)
+                     ├─ emit ARTIFACT events for each                      ◄── artifacts sent back
                      └─ emit RESULT(success, pr_url, ...)
                        │
                   stream closes
@@ -374,11 +776,15 @@ User ──POST /task──► Controller
                    Controller
                      │
                      ├─ Updates task in Map (status, pr_url, error, logs)
+                     ├─ Stores received artifacts in task.artifacts[]
                      ├─ Updates runner.runningTasks--
                      └─ Updates runner.lastTaskAt = now
                               │
                               └─ (ephemeral idle reaper checks later:
                                   if no tasks for 10min → drain & destroy)
+
+User ──GET /task/:id/artifacts──► Controller ──► list of plans/files created
+User ──POST /task/:id/artifacts/:path/promote──► saves artifact as config for future tasks
 ```
 
 ## Log Streaming
@@ -598,8 +1004,11 @@ CMD ["node", "src/runner/server.js"]
 ### Controller gains (new)
 
 - `POST/GET/DELETE /runners` endpoints
+- `POST/GET/PUT/DELETE /configs` endpoints (config store management)
+- `GET /task/:id/artifacts` and `POST /task/:id/artifacts/:path/promote` endpoints
 - `RunnerPool` class (Docker lifecycle management)
 - `TaskRouter` class (runner selection logic)
+- `ConfigStore` class (config file persistence and resolution)
 - gRPC client connections per runner
 
 ### Runner takes
@@ -612,6 +1021,8 @@ CMD ["node", "src/runner/server.js"]
 ### Runner gains (new)
 
 - gRPC server with `RunnerService` implementation
+- `ConfigDeployer` — writes received config files to correct paths before Claude runs
+- `ArtifactCollector` — scans for new/modified plans, rules, skills after Claude finishes
 - `Drain` support (stop accepting new tasks)
 - `RUNNER_ID`, `RUNNER_SOCKET`, `RUNNER_MAX_TASKS` env var handling
 
@@ -625,17 +1036,23 @@ CMD ["node", "src/runner/server.js"]
 
 4. **Create Runner gRPC server** — `src/runner/server.js`. Can be tested standalone.
 
-5. **Create Controller with single-runner support** — `src/controller/server.js` with hardcoded single gRPC client (same as original plan). Validates the gRPC protocol works end-to-end.
+5. **Create Controller with single-runner support** — `src/controller/server.js` with hardcoded single gRPC client. Validates the gRPC protocol works end-to-end.
 
-6. **Add RunnerPool + dockerode** — `src/controller/runner-pool.js`. Controller creates/manages Runner containers. Add `dockerode` dep.
+6. **Add config deployer + artifact collector** — `src/runner/config-deployer.js` and `src/runner/artifact-collector.js`. Integrate into executor: deploy configs before Claude, collect artifacts after.
 
-7. **Add TaskRouter** — `src/controller/task-router.js`. Auto-routing with ephemeral runner creation.
+7. **Add ConfigStore + config HTTP API** — `src/controller/config-store.js`. `POST/GET/PUT/DELETE /configs` endpoints. Store persists to `/data/configs/`.
 
-8. **Add runner management HTTP API** — `POST/GET/DELETE /runners` endpoints.
+8. **Add artifact HTTP API** — `GET /task/:id/artifacts`, `POST /task/:id/artifacts/:path/promote`. Controller accumulates artifacts from gRPC stream.
 
-9. **Docker split** — `Dockerfile.controller`, `Dockerfile.runner`, updated `docker-compose.yml`.
+9. **Add RunnerPool + dockerode** — `src/controller/runner-pool.js`. Controller creates/manages Runner containers. Add `dockerode` dep.
 
-10. **Remove monolith** — Delete `src/server.js`.
+10. **Add TaskRouter** — `src/controller/task-router.js`. Auto-routing with ephemeral runner creation.
+
+11. **Add runner management HTTP API** — `POST/GET/DELETE /runners` endpoints.
+
+12. **Docker split** — `Dockerfile.controller`, `Dockerfile.runner`, updated `docker-compose.yml`.
+
+13. **Remove monolith** — Delete `src/server.js`.
 
 ## Configuration
 
@@ -680,3 +1097,11 @@ All via environment variables:
 7. **gRPC stream lifetime** — `ExecuteTask` streams can last up to 1 hour (worker timeout). Do NOT set gRPC deadlines on these calls. The Runner manages its own internal timeouts.
 
 8. **Ephemeral runner startup latency** — Creating a new container takes 2-5 seconds. If this is too slow, maintain a small pool of "warm" ephemeral runners that are pre-created but idle. The idle reaper can maintain a minimum pool size.
+
+9. **Config file size in gRPC messages** — Config files are sent inline in the `ExecuteTaskRequest` protobuf message. Skills and MCP configs are typically small (< 10KB). If a config set grows large (many skills, large plan files), the gRPC message could exceed the default 4MB limit. Mitigate by setting `grpc.max_send_message_length` and `grpc.max_receive_message_length` on both client and server (e.g., 16MB), or by mounting a shared config volume instead of inline transfer.
+
+10. **Project-scoped config deployment timing** — Project-scoped configs must be deployed AFTER the orchestrator clones the repo but BEFORE the worker runs. The executor must split config deployment into two phases. If the orchestrator fails (no repo cloned), project-scoped configs are skipped gracefully.
+
+11. **Artifact diffing accuracy** — The artifact collector compares filesystem state before and after the worker runs. Files modified by git operations (checkout, merge) should not be treated as artifacts. The collector only scans `.claude/plans/`, `.claude/rules/`, and `.claude/skills/` directories — not the entire repo — to avoid false positives.
+
+12. **Promoting artifacts as configs** — When a user promotes an artifact to a config, the Controller must validate the content (is it valid markdown? valid JSON for MCP?) before persisting. Invalid configs could break future task executions.

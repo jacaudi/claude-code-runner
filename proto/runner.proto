@@ -9,8 +9,8 @@ package clauderunner;
 
 service RunnerService {
   // Execute a task (orchestrator + worker phases).
-  // Returns a server-side stream of TaskEvent messages covering
-  // status transitions, log lines, and final results.
+  // Controller sends config files (skills, rules, MCP, plans) in the request.
+  // Runner streams back logs, status changes, artifacts, and final result.
   rpc ExecuteTask(ExecuteTaskRequest) returns (stream TaskEvent);
 
   // Cancel a running task.
@@ -24,13 +24,61 @@ service RunnerService {
   rpc Drain(DrainRequest) returns (DrainResponse);
 }
 
+// ============ Shared: Config & Artifact Files ============
+
+// A configuration file pushed from Controller to Runner before task execution.
+// The Runner deploys these to the correct filesystem locations so the spawned
+// Claude process discovers them automatically.
+message ConfigFile {
+  string path = 1;        // Relative path within scope (e.g. "rules/security.md", ".mcp.json")
+  bytes content = 2;      // Raw file content
+  ConfigScope scope = 3;  // Where to deploy the file
+  ConfigType type = 4;    // What kind of config this is (for validation/routing)
+}
+
+// Where the Runner should deploy a config file.
+enum ConfigScope {
+  CONFIG_SCOPE_PROJECT = 0;  // Deploy relative to repo working directory
+  CONFIG_SCOPE_USER = 1;     // Deploy relative to ~/.claude/
+}
+
+// Classification of config files. Determines deployment path logic.
+enum ConfigType {
+  CONFIG_TYPE_SKILL = 0;   // Skill definition  -> .claude/skills/<name>/SKILL.md
+  CONFIG_TYPE_MCP = 1;     // MCP server config -> .mcp.json (project) or ~/.claude/settings.local.json
+  CONFIG_TYPE_RULE = 2;    // Rule file         -> .claude/rules/<name>.md or CLAUDE.md
+  CONFIG_TYPE_PLAN = 3;    // Plan file         -> .claude/plans/<name>.md
+  CONFIG_TYPE_OTHER = 4;   // Generic file      -> deployed at exact path
+}
+
+// A file produced by the Runner during task execution, streamed back to the Controller.
+// Typically plans created during Claude's work, but can be any output artifact.
+message Artifact {
+  string path = 1;           // Relative path where the file was found (e.g. ".claude/plans/refactor.md")
+  bytes content = 2;         // Raw file content
+  ArtifactType type = 3;     // Classification
+  string task_id = 4;        // Originating task (redundant with TaskEvent.task_id but useful standalone)
+}
+
+enum ArtifactType {
+  ARTIFACT_TYPE_PLAN = 0;    // Plan file created by Claude
+  ARTIFACT_TYPE_RULE = 1;    // Rule file created/modified by Claude
+  ARTIFACT_TYPE_SKILL = 2;   // Skill file created by Claude
+  ARTIFACT_TYPE_OTHER = 3;   // Any other output file
+}
+
 // ============ ExecuteTask ============
 
 message ExecuteTaskRequest {
-  string task_id = 1;            // Controller-assigned ID (e.g. "a1b2c3d4")
-  string prompt = 2;             // User's task prompt
-  string github_token = 3;       // Forwarded from Controller
-  string anthropic_api_key = 4;  // Optional, may be empty
+  string task_id = 1;                  // Controller-assigned ID (e.g. "a1b2c3d4")
+  string prompt = 2;                   // User's task prompt
+  string github_token = 3;            // Forwarded from Controller
+  string anthropic_api_key = 4;       // Optional, may be empty
+
+  // Config files to deploy before execution.
+  // Runner writes these to the filesystem before spawning Claude so it
+  // picks up skills, rules, MCP servers, and plans automatically.
+  repeated ConfigFile config_files = 5;
 }
 
 message TaskEvent {
@@ -41,12 +89,14 @@ message TaskEvent {
   string log_line = 3;           // for LOG
   TaskStatus status_update = 4;  // for STATUS_CHANGE
   TaskResult result = 5;         // for RESULT (terminal)
+  Artifact artifact = 6;         // for ARTIFACT
 }
 
 enum TaskEventType {
   LOG = 0;
   STATUS_CHANGE = 1;
   RESULT = 2;
+  ARTIFACT = 3;   // File produced by Runner, streamed back to Controller
 }
 
 message TaskStatus {
