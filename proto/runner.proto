@@ -2,7 +2,11 @@ syntax = "proto3";
 
 package clauderunner;
 
-// The Runner service, called by the Controller.
+// ============================================================
+// RunnerService — exposed by each Runner container.
+// Controller connects to each Runner via its unique Unix socket.
+// ============================================================
+
 service RunnerService {
   // Execute a task (orchestrator + worker phases).
   // Returns a server-side stream of TaskEvent messages covering
@@ -12,8 +16,12 @@ service RunnerService {
   // Cancel a running task.
   rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
 
-  // Health check -- lets the Controller verify the Runner is alive.
+  // Health check — lets the Controller verify the Runner is alive.
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+
+  // Drain — tell Runner to stop accepting new tasks and finish current ones.
+  // Used before tearing down persistent runners or rotating ephemeral ones.
+  rpc Drain(DrainRequest) returns (DrainResponse);
 }
 
 // ============ ExecuteTask ============
@@ -21,8 +29,8 @@ service RunnerService {
 message ExecuteTaskRequest {
   string task_id = 1;            // Controller-assigned ID (e.g. "a1b2c3d4")
   string prompt = 2;             // User's task prompt
-  string github_token = 3;      // Forwarded from Controller
-  string anthropic_api_key = 4; // Optional, may be empty
+  string github_token = 3;       // Forwarded from Controller
+  string anthropic_api_key = 4;  // Optional, may be empty
 }
 
 message TaskEvent {
@@ -49,7 +57,7 @@ message TaskStatus {
 message TaskResult {
   bool success = 1;
   string error_message = 2;  // empty on success
-  string error_type = 3;     // "timeout" | "exit_code" | "auth_expired" | "capacity_reached" | ""
+  string error_type = 3;     // "timeout" | "exit_code" | "auth_expired" | "capacity_reached" | "cancelled" | ""
   string pr_url = 4;         // extracted PR URL, empty if not found
 }
 
@@ -70,4 +78,15 @@ message HealthCheckRequest {}
 message HealthCheckResponse {
   bool ok = 1;
   int32 running_tasks = 2;
+  int32 max_concurrent_tasks = 3;  // Runner's capacity (from RUNNER_MAX_TASKS env)
+  string runner_id = 4;            // Runner's self-reported ID
+}
+
+// ============ Drain ============
+
+message DrainRequest {}
+
+message DrainResponse {
+  bool acknowledged = 1;
+  int32 remaining_tasks = 2;  // Tasks still running that must finish
 }
