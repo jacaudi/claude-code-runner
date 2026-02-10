@@ -8,8 +8,8 @@ package clauderunner;
 // ============================================================
 
 service RunnerService {
-  // Execute a task (orchestrator + worker phases).
-  // Controller sends config files (skills, rules, MCP, plans) in the request.
+  // Execute a task (orchestrator + worker phases, or worker-only for project tasks).
+  // Controller sends config files and optional project context in the request.
   // Runner streams back logs, status changes, artifacts, and final result.
   rpc ExecuteTask(ExecuteTaskRequest) returns (stream TaskEvent);
 
@@ -26,9 +26,6 @@ service RunnerService {
 
 // ============ Shared: Config & Artifact Files ============
 
-// A configuration file pushed from Controller to Runner before task execution.
-// The Runner deploys these to the correct filesystem locations so the spawned
-// Claude process discovers them automatically.
 message ConfigFile {
   string path = 1;        // Relative path within scope (e.g. "rules/security.md", ".mcp.json")
   bytes content = 2;      // Raw file content
@@ -36,13 +33,11 @@ message ConfigFile {
   ConfigType type = 4;    // What kind of config this is (for validation/routing)
 }
 
-// Where the Runner should deploy a config file.
 enum ConfigScope {
   CONFIG_SCOPE_PROJECT = 0;  // Deploy relative to repo working directory
   CONFIG_SCOPE_USER = 1;     // Deploy relative to ~/.claude/
 }
 
-// Classification of config files. Determines deployment path logic.
 enum ConfigType {
   CONFIG_TYPE_SKILL = 0;   // Skill definition  -> .claude/skills/<name>/SKILL.md
   CONFIG_TYPE_MCP = 1;     // MCP server config -> .mcp.json (project) or ~/.claude/settings.local.json
@@ -51,34 +46,52 @@ enum ConfigType {
   CONFIG_TYPE_OTHER = 4;   // Generic file      -> deployed at exact path
 }
 
-// A file produced by the Runner during task execution, streamed back to the Controller.
-// Typically plans created during Claude's work, but can be any output artifact.
 message Artifact {
-  string path = 1;           // Relative path where the file was found (e.g. ".claude/plans/refactor.md")
+  string path = 1;           // Relative path where the file was found
   bytes content = 2;         // Raw file content
   ArtifactType type = 3;     // Classification
-  string task_id = 4;        // Originating task (redundant with TaskEvent.task_id but useful standalone)
+  string task_id = 4;        // Originating task
 }
 
 enum ArtifactType {
-  ARTIFACT_TYPE_PLAN = 0;    // Plan file created by Claude
-  ARTIFACT_TYPE_RULE = 1;    // Rule file created/modified by Claude
-  ARTIFACT_TYPE_SKILL = 2;   // Skill file created by Claude
-  ARTIFACT_TYPE_OTHER = 3;   // Any other output file
+  ARTIFACT_TYPE_PLAN = 0;
+  ARTIFACT_TYPE_RULE = 1;
+  ARTIFACT_TYPE_SKILL = 2;
+  ARTIFACT_TYPE_OTHER = 3;
+}
+
+// ============ Project Context ============
+
+// Sent by Controller when a task is associated with a registered project.
+// When present, the Runner skips the orchestrator phase entirely — the
+// worktree is already mounted, the branch is already checked out.
+message ProjectContext {
+  string project_id = 1;       // Controller's project ID
+  string repo_name = 2;        // Human-readable repo name (e.g. "my-api")
+  string branch_name = 3;      // Branch already checked out in the mounted worktree
+  string default_branch = 4;   // For reference (e.g. "main")
+  string forge_type = 5;       // "github" | "forgejo" | "gitlab"
+
+  // Issue context (if task is for a specific issue)
+  string issue_number = 6;     // Forge issue number, for PR cross-references
+  string issue_title = 7;      // For commit messages and PR titles
+  string issue_url = 8;        // Full URL for linking in PR body
 }
 
 // ============ ExecuteTask ============
 
 message ExecuteTaskRequest {
-  string task_id = 1;                  // Controller-assigned ID (e.g. "a1b2c3d4")
+  string task_id = 1;                  // Controller-assigned ID
   string prompt = 2;                   // User's task prompt
-  string github_token = 3;            // Forwarded from Controller
-  string anthropic_api_key = 4;       // Optional, may be empty
+  string github_token = 3;            // Forwarded from Controller (also used for Forgejo)
+  string anthropic_api_key = 4;       // Optional
 
-  // Config files to deploy before execution.
-  // Runner writes these to the filesystem before spawning Claude so it
-  // picks up skills, rules, MCP servers, and plans automatically.
   repeated ConfigFile config_files = 5;
+
+  // If set, Runner skips orchestrator phase and works directly in the
+  // pre-mounted worktree. The Controller handles repo cloning, worktree
+  // creation, and branch setup before dispatching the task.
+  ProjectContext project_context = 6;
 }
 
 message TaskEvent {
@@ -96,7 +109,7 @@ enum TaskEventType {
   LOG = 0;
   STATUS_CHANGE = 1;
   RESULT = 2;
-  ARTIFACT = 3;   // File produced by Runner, streamed back to Controller
+  ARTIFACT = 3;
 }
 
 message TaskStatus {
@@ -106,9 +119,10 @@ message TaskStatus {
 
 message TaskResult {
   bool success = 1;
-  string error_message = 2;  // empty on success
+  string error_message = 2;
   string error_type = 3;     // "timeout" | "exit_code" | "auth_expired" | "capacity_reached" | "cancelled" | ""
-  string pr_url = 4;         // extracted PR URL, empty if not found
+  string pr_url = 4;         // Extracted PR/MR URL
+  string branch_name = 5;    // Branch the work was done on (useful for Controller to track)
 }
 
 // ============ CancelTask ============
@@ -128,8 +142,8 @@ message HealthCheckRequest {}
 message HealthCheckResponse {
   bool ok = 1;
   int32 running_tasks = 2;
-  int32 max_concurrent_tasks = 3;  // Runner's capacity (from RUNNER_MAX_TASKS env)
-  string runner_id = 4;            // Runner's self-reported ID
+  int32 max_concurrent_tasks = 3;
+  string runner_id = 4;
 }
 
 // ============ Drain ============
@@ -138,5 +152,5 @@ message DrainRequest {}
 
 message DrainResponse {
   bool acknowledged = 1;
-  int32 remaining_tasks = 2;  // Tasks still running that must finish
+  int32 remaining_tasks = 2;
 }

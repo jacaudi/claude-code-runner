@@ -16,6 +16,8 @@ The Controller manages a **pool of Runners**. Runners come in two flavors:
 
 Communication: gRPC over per-runner Unix domain sockets in a shared bind-mount directory.
 
+The system supports **Projects** (registered git repos on GitHub, Forgejo, or GitLab) with **Issues** (bugs, features, dependency updates) that decompose into Tasks. See [Projects and Issues](./projects-and-issues.md) for the full design.
+
 ## Architecture Diagram
 
 ```
@@ -113,9 +115,17 @@ claude-code-runner/
 ├── src/
 │   ├── controller/
 │   │   ├── server.js                    # Express app, auth, routes, startup
+│   │   ├── db.js                        # SQLite setup, migrations, prepared statements
 │   │   ├── runner-pool.js               # Runner lifecycle: create, destroy, health, reap
 │   │   ├── task-router.js               # Decide which Runner gets a task
+│   │   ├── project-manager.js           # Project CRUD, bare repo cache, worktree lifecycle
+│   │   ├── issue-manager.js             # Issue CRUD, forge sync, status transitions
 │   │   ├── config-store.js              # Config file storage + retrieval (skills, rules, MCP, plans)
+│   │   ├── forge/                       # Forge abstraction layer
+│   │   │   ├── index.js                 # ForgeClient base class + factory
+│   │   │   ├── github.js               # GitHub (Octokit)
+│   │   │   ├── gitlab.js               # GitLab (Gitbeaker)
+│   │   │   └── forgejo.js              # Forgejo (Octokit + custom auth)
 │   │   └── static/
 │   │       ├── dashboard.html
 │   │       ├── login.html
@@ -979,12 +989,18 @@ CMD ["node", "src/runner/server.js"]
 {
   "@grpc/grpc-js": "^1.10.0",
   "@grpc/proto-loader": "^0.7.12",
-  "dockerode": "^4.0.0"
+  "dockerode": "^4.0.0",
+  "better-sqlite3": "^11.0.0",
+  "@octokit/rest": "^21.0.0",
+  "@gitbeaker/rest": "^40.0.0"
 }
 ```
 
 - `@grpc/grpc-js` + `@grpc/proto-loader` — gRPC on both Controller (client) and Runner (server)
 - `dockerode` — Controller only, for Docker container management
+- `better-sqlite3` — Controller only, persistence for projects/issues/tasks
+- `@octokit/rest` — Controller only, GitHub + Forgejo API client
+- `@gitbeaker/rest` — Controller only, GitLab API client
 - `node-pty` — Runner only (already in package.json)
 - `express`, `express-session`, `bcryptjs` — Controller only (already in package.json)
 
@@ -1050,9 +1066,21 @@ CMD ["node", "src/runner/server.js"]
 
 11. **Add runner management HTTP API** — `POST/GET/DELETE /runners` endpoints.
 
-12. **Docker split** — `Dockerfile.controller`, `Dockerfile.runner`, updated `docker-compose.yml`.
+12. **Add SQLite persistence** — `src/controller/db.js`. Migrate in-memory task `Map` to SQLite. Tasks persist across restarts.
 
-13. **Remove monolith** — Delete `src/server.js`.
+13. **Add Project Manager** — `src/controller/project-manager.js`. Project registration, bare repo cloning, worktree lifecycle. `POST/GET/DELETE /projects`.
+
+14. **Add Forge abstraction** — `src/controller/forge/`. GitHub implementation first. Issue sync, PR comments.
+
+15. **Add Issue Manager** — `src/controller/issue-manager.js`. Issue CRUD, lifecycle transitions. `POST/GET/PATCH /projects/:id/issues`, `POST /issues/:id/tasks`.
+
+16. **Wire project_context into task dispatch** — When a task has a project, Controller creates worktree, mounts into Runner, sends `ProjectContext`. Runner skips orchestrator.
+
+17. **Add GitLab + Forgejo forge implementations** — Complete multi-forge support.
+
+18. **Docker split** — `Dockerfile.controller`, `Dockerfile.runner`, updated `docker-compose.yml`.
+
+19. **Remove monolith** — Delete `src/server.js`.
 
 ## Configuration
 
