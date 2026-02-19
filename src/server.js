@@ -8,6 +8,8 @@ import { fileURLToPath } from 'url';
 import path from 'path';
 import { createDispatcher } from './dispatchers/index.js';
 import { RedisQueue } from './queue/redis.js';
+import { buildClaudeEnv, credentialStatus } from './credentials.js';
+import { ShadowRepoManager } from './git/shadow-repo.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -155,6 +157,7 @@ const tasks = useRedis ? null : new Map(); // In-memory store only for local/k8s
 const WORK_DIR = '/tmp/work';
 const TASK_TIMEOUT = 60 * 60 * 1000; // 1 hour
 const dispatcher = createDispatcher(undefined, { redisQueue });
+const shadowRepos = new ShadowRepoManager();
 
 // ============ Task State Helpers ============
 
@@ -442,6 +445,7 @@ app.get('/health', async (req, res) => {
   const health = {
     ok: true,
     dispatchMode: DISPATCH_MODE,
+    credentials: await credentialStatus().catch(() => ({ activeProvider: 'unknown' })),
   };
 
   if (useRedis) {
@@ -467,6 +471,39 @@ app.get('/health', async (req, res) => {
 app.get('/tasks', async (req, res) => {
   const taskList = await listAllTasks();
   res.json(taskList);
+});
+
+// ============ Shadow Repository Endpoints ============
+
+// Get commit history for a task's branch
+app.get('/task/:id/commits', async (req, res) => {
+  const commits = await shadowRepos.getCommits(req.params.id);
+  res.json(commits);
+});
+
+// Get diff summary for most recent commit
+app.get('/task/:id/diff', async (req, res) => {
+  const diff = await shadowRepos.getLatestDiff(req.params.id);
+  res.json(diff);
+});
+
+// Get cumulative diff stats
+app.get('/task/:id/stats', async (req, res) => {
+  const stats = await shadowRepos.getDiffStats(req.params.id);
+  res.json(stats || { files: 0, insertions: 0, deletions: 0 });
+});
+
+// Force fetch latest changes for a task
+app.post('/task/:id/sync', async (req, res) => {
+  await shadowRepos.fetch(req.params.id);
+  res.json({ ok: true });
+});
+
+// ============ Credential Status ============
+
+app.get('/api/credentials', async (req, res) => {
+  const status = await credentialStatus();
+  res.json(status);
 });
 
 // Dashboard UI
@@ -499,10 +536,17 @@ async function runTask(id, prompt, taskDir) {
   await runOrchestrator(id, prompt, taskDir, branchName, logFile);
   await appendFile(logFile, `\n=== ORCHESTRATOR COMPLETE ===\n\n`);
 
+  // Start shadow repo tracking after orchestrator sets up the branch.
+  // Read the repo's remote URL so we can clone a shadow for progress monitoring.
+  await startShadowTracking(id, repoDir, branchName);
+
   // Phase 2: Worker - run in cloned repo
   await appendFile(logFile, `=== WORKER PHASE ===\n`);
   const result = await runWorker(id, prompt, repoDir, branchName, logFile);
   await appendFile(logFile, `\n=== WORKER COMPLETE ===\n`);
+
+  // Stop shadow tracking after worker completes
+  await shadowRepos.untrack(id).catch(() => {});
 
   return result;
 }
@@ -511,6 +555,7 @@ async function runTask(id, prompt, taskDir) {
 
 async function runRedisOrchestrator(id, prompt, taskDir, branchName) {
   const fullPrompt = getOrchestratorPrompt(prompt, taskDir, branchName);
+  const claudeEnv = await buildClaudeEnv();
 
   return new Promise((resolve, reject) => {
     const proc = dispatcher.spawn('claude', [
@@ -520,10 +565,7 @@ async function runRedisOrchestrator(id, prompt, taskDir, branchName) {
       '--dangerously-skip-permissions'
     ], {
       cwd: taskDir,
-      env: {
-        ...process.env,
-        GH_TOKEN: process.env.GITHUB_TOKEN
-      },
+      env: claudeEnv,
       cols: 200,
       rows: 50,
       taskId: `${id}-orch`,
@@ -555,6 +597,7 @@ async function runRedisOrchestrator(id, prompt, taskDir, branchName) {
 
 async function runRedisWorker(id, prompt, repoDir, branchName) {
   const systemPrompt = getWorkerSystemPrompt(branchName);
+  const claudeEnv = await buildClaudeEnv();
 
   return new Promise((resolve, reject) => {
     const proc = dispatcher.spawn('claude', [
@@ -565,10 +608,7 @@ async function runRedisWorker(id, prompt, repoDir, branchName) {
       '--dangerously-skip-permissions'
     ], {
       cwd: repoDir,
-      env: {
-        ...process.env,
-        GH_TOKEN: process.env.GITHUB_TOKEN
-      },
+      env: claudeEnv,
       cols: 200,
       rows: 50,
       taskId: `${id}-worker`,
@@ -610,6 +650,7 @@ async function runRedisWorker(id, prompt, repoDir, branchName) {
 async function runOrchestrator(id, prompt, taskDir, branchName, logFile) {
   const logStream = createWriteStream(logFile, { flags: 'a' });
   const fullPrompt = getOrchestratorPrompt(prompt, taskDir, branchName);
+  const claudeEnv = await buildClaudeEnv();
 
   return new Promise((resolve, reject) => {
     const proc = dispatcher.spawn('claude', [
@@ -619,10 +660,7 @@ async function runOrchestrator(id, prompt, taskDir, branchName, logFile) {
       '--dangerously-skip-permissions'
     ], {
       cwd: taskDir,
-      env: {
-        ...process.env,
-        GH_TOKEN: process.env.GITHUB_TOKEN
-      },
+      env: claudeEnv,
       cols: 200,
       rows: 50
     });
@@ -660,6 +698,7 @@ async function runOrchestrator(id, prompt, taskDir, branchName, logFile) {
 async function runWorker(id, prompt, repoDir, branchName, logFile) {
   const logStream = createWriteStream(logFile, { flags: 'a' });
   const systemPrompt = getWorkerSystemPrompt(branchName);
+  const claudeEnv = await buildClaudeEnv();
 
   return new Promise((resolve, reject) => {
     const proc = dispatcher.spawn('claude', [
@@ -670,10 +709,7 @@ async function runWorker(id, prompt, repoDir, branchName, logFile) {
       '--dangerously-skip-permissions'
     ], {
       cwd: repoDir,
-      env: {
-        ...process.env,
-        GH_TOKEN: process.env.GITHUB_TOKEN
-      },
+      env: claudeEnv,
       cols: 200,
       rows: 50
     });
@@ -718,9 +754,49 @@ async function runWorker(id, prompt, repoDir, branchName, logFile) {
   });
 }
 
+// ============ Shadow Repo Helpers ============
+
+/**
+ * Start shadow tracking for a task after the orchestrator clones the repo.
+ * Reads the git remote URL from the cloned repo and starts a shadow clone.
+ */
+async function startShadowTracking(taskId, repoDir, branchName) {
+  try {
+    const { execFile } = await import('child_process');
+    const { promisify } = await import('util');
+    const exec = promisify(execFile);
+
+    const { stdout } = await exec('/usr/bin/git.real', ['remote', 'get-url', 'origin'], {
+      cwd: repoDir,
+      timeout: 5000,
+    });
+    let repoUrl = stdout.trim();
+
+    // Inject token for authenticated HTTPS access
+    const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+    if (token && repoUrl.startsWith('https://')) {
+      repoUrl = repoUrl.replace('https://', `https://x-access-token:${token}@`);
+    }
+
+    await shadowRepos.track(taskId, repoUrl, branchName);
+    console.log(`[${taskId}] Shadow repo tracking started for ${branchName}`);
+  } catch (err) {
+    // Non-fatal — shadow tracking is optional observability
+    console.warn(`[${taskId}] Shadow repo tracking failed:`, err.message);
+  }
+}
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Claude Runner listening on :${PORT}`);
   console.log(`Dispatch mode: ${DISPATCH_MODE}`);
   if (useRedis) console.log(`Redis URL: ${REDIS_URL.replace(/\/\/.*@/, '//***@')}`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('[server] SIGTERM received, shutting down...');
+  await shadowRepos.cleanup().catch(() => {});
+  if (redisQueue) await redisQueue.close().catch(() => {});
+  server.close();
 });

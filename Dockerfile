@@ -10,6 +10,13 @@ RUN apt-get update && apt-get install -y \
     jq \
     && rm -rf /var/lib/apt/lists/*
 
+# Git wrapper for branch protection
+# Prevents Claude from switching to existing branches (main, etc.)
+# Only allows creating new branches via `git checkout -b` or `git switch -c`
+RUN mv /usr/bin/git /usr/bin/git.real
+COPY docker/git-wrapper.sh /usr/bin/git
+RUN chmod +x /usr/bin/git
+
 # gh CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
@@ -19,13 +26,16 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | d
 RUN npm install -g @anthropic-ai/claude-code
 
 # Create ~/.claude directory for Claude Code credentials and runtime files
-# Only .credentials.json is mounted from host; other files stay in container
 RUN mkdir -p /home/node/.claude && chown -R node:node /home/node
 
 WORKDIR /app
 COPY package.json ./
 RUN npm install
 COPY src ./src
+
+# Copy entrypoint script
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # Give node user ownership of app
 RUN chown -R node:node /app
@@ -35,6 +45,9 @@ RUN mkdir -p /tmp/work && chown -R node:node /tmp/work
 
 # Create data directory for persistent auth storage
 RUN mkdir -p /data && chown -R node:node /data
+
+# Create staging directory for credential copy-on-start
+RUN mkdir -p /tmp/.credentials-staging && chown -R node:node /tmp/.credentials-staging
 
 # Allow node user to install global packages (npm, pip, gem, etc.)
 # Claude runs as non-root but needs to install tools dynamically.
@@ -48,8 +61,8 @@ ENV PATH=/home/node/.local/bin:/home/node/.cargo/bin:/home/node/go/bin:/home/nod
 USER node
 
 # Git config for commits (as node user)
-RUN git config --global user.email "noreply@anthropic.com" \
-    && git config --global user.name "Claude"
+RUN git.real config --global user.email "noreply@anthropic.com" \
+    && git.real config --global user.name "Claude"
 
 EXPOSE 3000
 
@@ -58,4 +71,5 @@ EXPOSE 3000
 #   "worker" - Redis queue worker that executes tasks
 ENV MODE=server
 
-CMD ["sh", "-c", "if [ \"$MODE\" = \"worker\" ]; then node src/worker.js; else node src/server.js; fi"]
+ENTRYPOINT ["entrypoint.sh"]
+CMD ["auto"]

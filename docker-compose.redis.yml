@@ -9,8 +9,10 @@
 ##   docker compose -f docker-compose.redis.yml up --scale worker=3
 ##
 ## Environment variables (set in .env or export):
-##   GITHUB_TOKEN      - Required, GitHub PAT with repo/read:org/workflow scopes
-##   ANTHROPIC_API_KEY - Optional, falls back to mounted OAuth credentials
+##   GITHUB_TOKEN              - Required, GitHub PAT with repo/read:org/workflow scopes
+##   ANTHROPIC_API_KEY         - Optional, falls back to mounted OAuth credentials
+##   CLAUDE_CODE_USE_BEDROCK   - Optional, set to "1" to use AWS Bedrock
+##   CLAUDE_CODE_USE_VERTEX    - Optional, set to "1" to use Google Vertex
 
 services:
   redis:
@@ -34,12 +36,15 @@ services:
     environment:
       - GITHUB_TOKEN=${GITHUB_TOKEN}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - CLAUDE_CODE_USE_BEDROCK=${CLAUDE_CODE_USE_BEDROCK:-}
+      - CLAUDE_CODE_USE_VERTEX=${CLAUDE_CODE_USE_VERTEX:-}
       - PORT=3000
       - DISPATCH_MODE=redis
       - REDIS_URL=redis://redis:6379
       - MODE=server
     volumes:
-      - ~/.claude/.credentials.json:/home/node/.claude/.credentials.json:ro
+      # Copy-not-mount: credentials staged here, copied by entrypoint.sh
+      - ~/.claude/.credentials.json:/tmp/.credentials-staging/.credentials.json:ro
       - claude-data:/data
     depends_on:
       redis:
@@ -57,10 +62,13 @@ services:
     environment:
       - GITHUB_TOKEN=${GITHUB_TOKEN}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - CLAUDE_CODE_USE_BEDROCK=${CLAUDE_CODE_USE_BEDROCK:-}
+      - CLAUDE_CODE_USE_VERTEX=${CLAUDE_CODE_USE_VERTEX:-}
       - REDIS_URL=redis://redis:6379
       - MODE=worker
     volumes:
-      - ~/.claude/.credentials.json:/home/node/.claude/.credentials.json:ro
+      # Copy-not-mount: credentials staged here, copied by entrypoint.sh
+      - ~/.claude/.credentials.json:/tmp/.credentials-staging/.credentials.json:ro
     depends_on:
       redis:
         condition: service_healthy

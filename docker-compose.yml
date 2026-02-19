@@ -7,12 +7,14 @@ services:
     environment:
       - GITHUB_TOKEN=${GITHUB_TOKEN}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - CLAUDE_CODE_USE_BEDROCK=${CLAUDE_CODE_USE_BEDROCK:-}
+      - CLAUDE_CODE_USE_VERTEX=${CLAUDE_CODE_USE_VERTEX:-}
       - PORT=3000
       - DISPATCH_MODE=${DISPATCH_MODE:-local}
     volumes:
-      # Mount only OAuth credentials, not the entire ~/.claude directory
-      # This keeps debug logs and other runtime files inside the container
-      - ~/.claude/.credentials.json:/home/node/.claude/.credentials.json:ro
+      # Copy-not-mount: credentials staged here, copied by entrypoint.sh
+      # to /home/node/.claude/ with proper permissions at startup
+      - ~/.claude/.credentials.json:/tmp/.credentials-staging/.credentials.json:ro
       - claude-data:/data
     restart: unless-stopped
     healthcheck:
