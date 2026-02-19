@@ -18,6 +18,8 @@ import { RedisDispatcher } from './redis-worker.js';
  * @property {number|string} pid - Process or pod identifier
  * @property {function(function(string): void): void} onData - Register data callback
  * @property {function(function({exitCode: number}): void): void} onExit - Register exit callback
+ * @property {function(string): void} write - Write data to process stdin (for terminal interaction)
+ * @property {function(number, number): void} resize - Resize terminal (cols, rows)
  * @property {function(): void} kill - Terminate the process
  */
 

@@ -25,6 +25,8 @@ export class LocalDispatcher {
       pid: proc.pid,
       onData: (cb) => proc.onData(cb),
       onExit: (cb) => proc.onExit(cb),
+      write: (data) => proc.write(data),
+      resize: (cols, rows) => proc.resize(cols, rows),
       kill: () => proc.kill(),
     };
   }

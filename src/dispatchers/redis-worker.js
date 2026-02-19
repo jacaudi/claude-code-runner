@@ -1,10 +1,14 @@
 import { LocalDispatcher } from './local.js';
 
+const TERM_INPUT_PREFIX = 'claude:term-input:';
+const TERM_RESIZE_PREFIX = 'claude:term-resize:';
+
 /**
  * Dispatcher that enqueues tasks to Redis instead of running them directly.
  *
  * On the API server side, spawn() pushes the task to Redis and returns
  * a ProcessHandle that subscribes to Redis pub/sub for logs and status.
+ * write() and resize() are relayed via Redis pub/sub to the worker pod.
  *
  * Actual execution happens in a separate worker pod (src/worker.js)
  * that pulls from the same Redis queue and runs the Claude process locally.
@@ -68,6 +72,17 @@ export class RedisDispatcher {
       pid: `redis:${taskId}`,
       onData: (cb) => { dataCallback = cb; },
       onExit: (cb) => { exitCallback = cb; },
+      write: (data) => {
+        // Relay stdin to worker via Redis pub/sub
+        this.queue.pubRedis.publish(TERM_INPUT_PREFIX + taskId, data).catch(() => {});
+      },
+      resize: (cols, rows) => {
+        // Relay resize to worker via Redis pub/sub
+        this.queue.pubRedis.publish(
+          TERM_RESIZE_PREFIX + taskId,
+          JSON.stringify({ cols, rows })
+        ).catch(() => {});
+      },
       kill: () => {
         // Publish a kill signal; the worker checks for it
         this.queue.publishStatus(taskId, { event: 'kill' }).catch(() => {});
@@ -83,6 +98,7 @@ export class RedisDispatcher {
  *
  * This runs in worker pods. It blocks on BRPOP waiting for tasks,
  * spawns them with LocalDispatcher, and streams results back via Redis.
+ * Terminal stdin input and resize events are relayed from Redis pub/sub.
  */
 export class RedisWorkerExecutor {
   /**
@@ -165,6 +181,24 @@ export class RedisWorkerExecutor {
 
       this.currentProc = proc;
 
+      // Subscribe to terminal input from Redis (relayed from web terminal)
+      const inputChannel = TERM_INPUT_PREFIX + task.id;
+      const resizeChannel = TERM_RESIZE_PREFIX + task.id;
+
+      this.queue.subRedis.subscribe(inputChannel, resizeChannel);
+
+      const inputHandler = (ch, message) => {
+        if (ch === inputChannel) {
+          proc.write(message);
+        } else if (ch === resizeChannel) {
+          try {
+            const { cols, rows } = JSON.parse(message);
+            proc.resize(cols, rows);
+          } catch { /* ignore malformed resize */ }
+        }
+      };
+      this.queue.subRedis.on('message', inputHandler);
+
       proc.onData((data) => {
         // Stream logs back via Redis pub/sub + persist
         this.queue.publishLog(task.id, data).catch(() => {});
@@ -174,6 +208,10 @@ export class RedisWorkerExecutor {
       proc.onExit(async ({ exitCode }) => {
         this.currentProc = null;
         unsubKill();
+
+        // Clean up terminal input subscription
+        this.queue.subRedis.unsubscribe(inputChannel, resizeChannel);
+        this.queue.subRedis.removeListener('message', inputHandler);
 
         const status = exitCode === 0 ? 'completed' : 'failed';
         const update = {

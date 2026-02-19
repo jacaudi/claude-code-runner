@@ -10,6 +10,8 @@ import { createDispatcher } from './dispatchers/index.js';
 import { RedisQueue } from './queue/redis.js';
 import { buildClaudeEnv, credentialStatus } from './credentials.js';
 import { ShadowRepoManager } from './git/shadow-repo.js';
+import { TerminalSessionManager } from './terminal/session-manager.js';
+import { WebSocketServer } from 'ws';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -158,6 +160,7 @@ const WORK_DIR = '/tmp/work';
 const TASK_TIMEOUT = 60 * 60 * 1000; // 1 hour
 const dispatcher = createDispatcher(undefined, { redisQueue });
 const shadowRepos = new ShadowRepoManager();
+const terminalSessions = new TerminalSessionManager();
 
 // ============ Task State Helpers ============
 
@@ -506,6 +509,28 @@ app.get('/api/credentials', async (req, res) => {
   res.json(status);
 });
 
+// ============ Terminal Endpoints ============
+
+// Terminal page (xterm.js UI)
+app.get('/task/:id/terminal', async (req, res) => {
+  const task = await getTask(req.params.id);
+  if (!task) return res.status(404).json({ error: 'Not found' });
+  const html = await readFile(path.join(__dirname, 'terminal.html'), 'utf-8');
+  res.setHeader('Content-Type', 'text/html');
+  res.send(html);
+});
+
+// Terminal session info
+app.get('/task/:id/terminal/info', (req, res) => {
+  const info = terminalSessions.getInfo(req.params.id);
+  res.json(info || { taskId: req.params.id, alive: false, viewers: 0 });
+});
+
+// List all active terminal sessions
+app.get('/api/terminal/sessions', (req, res) => {
+  res.json(terminalSessions.listSessions());
+});
+
 // Dashboard UI
 app.get('/', async (req, res) => {
   const html = await readFile(path.join(__dirname, 'dashboard.html'), 'utf-8');
@@ -625,11 +650,15 @@ async function runRedisWorker(id, prompt, repoDir, branchName) {
 
     console.log(`[${id}] Worker dispatched to Redis queue`);
 
+    // Register terminal session so web clients can attach
+    terminalSessions.register(id, proc);
+
     let output = '';
     proc.onData((data) => { output += data; });
 
     proc.onExit(async ({ exitCode }) => {
       clearTimeout(timeout);
+      terminalSessions.remove(id);
 
       const prMatch = output.match(/https:\/\/github\.com\/[^\s]+\/pull\/\d+/);
 
@@ -725,6 +754,9 @@ async function runWorker(id, prompt, repoDir, branchName, logFile) {
 
     console.log(`[${id}] Worker spawned in ${repoDir}, pid: ${proc.pid}`);
 
+    // Register terminal session so web clients can attach
+    terminalSessions.register(id, proc);
+
     proc.onData(data => {
       output += data;
       logStream.write(data);
@@ -733,6 +765,7 @@ async function runWorker(id, prompt, repoDir, branchName, logFile) {
     proc.onExit(async ({ exitCode }) => {
       clearTimeout(timeout);
       logStream.end();
+      terminalSessions.remove(id);
 
       // Parse PR URL from worker output
       const prMatch = output.match(/https:\/\/github\.com\/[^\s]+\/pull\/\d+/);
@@ -793,10 +826,39 @@ const server = app.listen(PORT, () => {
   if (useRedis) console.log(`Redis URL: ${REDIS_URL.replace(/\/\/.*@/, '//***@')}`);
 });
 
+// ============ WebSocket Server for Terminal ============
+
+const wss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (request, socket, head) => {
+  // Match /task/:id/terminal/ws
+  const match = request.url?.match(/^\/task\/([^/]+)\/terminal\/ws$/);
+  if (!match) {
+    socket.destroy();
+    return;
+  }
+
+  const taskId = match[1];
+
+  wss.handleUpgrade(request, socket, head, (ws) => {
+    // Try to attach to an existing terminal session
+    const attached = terminalSessions.attach(taskId, ws);
+    if (!attached) {
+      ws.send(JSON.stringify({
+        type: 'error',
+        message: `No active terminal session for task ${taskId}. Task may not be running.`,
+      }));
+      ws.close(1008, 'No active session');
+    }
+  });
+});
+
 // Graceful shutdown
 process.on('SIGTERM', async () => {
   console.log('[server] SIGTERM received, shutting down...');
+  terminalSessions.cleanup();
   await shadowRepos.cleanup().catch(() => {});
   if (redisQueue) await redisQueue.close().catch(() => {});
+  wss.close();
   server.close();
 });
