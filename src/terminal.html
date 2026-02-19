@@ -186,7 +186,8 @@
       }
 
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const url = `${proto}//${window.location.host}/task/${taskId}/terminal/ws`;
+      const wsToken = '__WS_TOKEN__';
+      const url = `${proto}//${window.location.host}/task/${taskId}/terminal/ws?token=${encodeURIComponent(wsToken)}`;
       ws = new WebSocket(url);
 
       ws.onopen = () => {

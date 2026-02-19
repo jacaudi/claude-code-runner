@@ -515,7 +515,10 @@ app.get('/api/credentials', async (req, res) => {
 app.get('/task/:id/terminal', async (req, res) => {
   const task = await getTask(req.params.id);
   if (!task) return res.status(404).json({ error: 'Not found' });
-  const html = await readFile(path.join(__dirname, 'terminal.html'), 'utf-8');
+  let html = await readFile(path.join(__dirname, 'terminal.html'), 'utf-8');
+  // Inject WebSocket auth token so the browser can authenticate the upgrade
+  // request (session cookies don't apply to raw WebSocket upgrades).
+  html = html.replace('__WS_TOKEN__', currentToken || '');
   res.setHeader('Content-Type', 'text/html');
   res.send(html);
 });
@@ -799,7 +802,8 @@ async function startShadowTracking(taskId, repoDir, branchName) {
     const { promisify } = await import('util');
     const exec = promisify(execFile);
 
-    const { stdout } = await exec('/usr/bin/git.real', ['remote', 'get-url', 'origin'], {
+    const gitBin = existsSync('/usr/bin/git.real') ? '/usr/bin/git.real' : 'git';
+    const { stdout } = await exec(gitBin, ['remote', 'get-url', 'origin'], {
       cwd: repoDir,
       timeout: 5000,
     });
@@ -834,6 +838,16 @@ server.on('upgrade', (request, socket, head) => {
   // Match /task/:id/terminal/ws
   const match = request.url?.match(/^\/task\/([^/]+)\/terminal\/ws$/);
   if (!match) {
+    socket.destroy();
+    return;
+  }
+
+  // Authenticate WebSocket upgrades via Bearer token in query string
+  // (WebSocket API doesn't support custom headers, so token is passed as ?token=...)
+  const url = new URL(request.url, `http://${request.headers.host}`);
+  const token = url.searchParams.get('token');
+  if (!currentToken || token !== currentToken) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
     socket.destroy();
     return;
   }

@@ -71,6 +71,8 @@ export class KubernetesDispatcher {
       pid: jobName,
       onData: (cb) => { dataCallback = cb; },
       onExit: (cb) => { exitCallback = cb; },
+      write: () => {}, // K8s jobs don't support stdin; no-op for interface compat
+      resize: () => {}, // K8s jobs don't support resize; no-op for interface compat
       kill: () => {
         killed = true;
         this._deleteJob(jobName, namespace).catch((err) => {

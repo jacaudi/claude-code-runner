@@ -5,7 +5,9 @@ import { promisify } from 'util';
 import path from 'path';
 
 const exec = promisify(execFile);
-const GIT = '/usr/bin/git.real';
+
+// Default to git.real (Docker container) with fallback to git
+const DEFAULT_GIT = existsSync('/usr/bin/git.real') ? '/usr/bin/git.real' : 'git';
 const SHADOW_DIR = '/tmp/claude-shadows';
 
 /**
@@ -23,9 +25,14 @@ const SHADOW_DIR = '/tmp/claude-shadows';
  * that periodically fetches from origin to stay current.
  */
 export class ShadowRepoManager {
-  constructor() {
+  /**
+   * @param {Object} [options]
+   * @param {string} [options.gitBinary] - Path to git binary (defaults to git.real or git)
+   */
+  constructor(options = {}) {
     /** @type {Map<string, {repoUrl: string, branch: string, interval: NodeJS.Timeout|null}>} */
     this.tracked = new Map();
+    this.git = options.gitBinary || DEFAULT_GIT;
   }
 
   /**
@@ -45,7 +52,7 @@ export class ShadowRepoManager {
 
     try {
       // Shallow clone just the task branch (minimal data transfer)
-      await exec(GIT, [
+      await exec(this.git, [
         'clone',
         '--bare',
         '--single-branch',
@@ -57,8 +64,8 @@ export class ShadowRepoManager {
     } catch (err) {
       // Branch might not exist yet (orchestrator hasn't pushed).
       // Create an empty bare repo and set up the remote for later fetching.
-      await exec(GIT, ['init', '--bare', shadowPath]);
-      await exec(GIT, ['remote', 'add', 'origin', repoUrl], { cwd: shadowPath });
+      await exec(this.git, ['init', '--bare', shadowPath]);
+      await exec(this.git, ['remote', 'add', 'origin', repoUrl], { cwd: shadowPath });
     }
 
     const entry = { repoUrl, branch, interval: null };
@@ -66,7 +73,7 @@ export class ShadowRepoManager {
     // Periodic fetch
     entry.interval = setInterval(async () => {
       try {
-        await exec(GIT, ['fetch', 'origin', branch, '--depth', '50'], {
+        await exec(this.git, ['fetch', 'origin', branch, '--depth', '50'], {
           cwd: shadowPath,
           timeout: 30000,
         });
@@ -107,15 +114,15 @@ export class ShadowRepoManager {
     if (!existsSync(shadowPath)) return [];
 
     try {
-      const { stdout } = await exec(GIT, [
+      const { stdout } = await exec(this.git, [
         'log',
-        `origin/${entry.branch}`,
+        `refs/heads/${entry.branch}`,
         `--max-count=${maxCount}`,
-        '--format=%H|%s|%aI|%an',
+        '--format=%H%x00%s%x00%aI%x00%an',
       ], { cwd: shadowPath, timeout: 5000 });
 
       return stdout.trim().split('\n').filter(Boolean).map(line => {
-        const [hash, message, date, author] = line.split('|');
+        const [hash, message, date, author] = line.split('\0');
         return { hash, message, date, author };
       });
     } catch {
@@ -137,10 +144,10 @@ export class ShadowRepoManager {
     if (!existsSync(shadowPath)) return [];
 
     try {
-      const { stdout } = await exec(GIT, [
+      const { stdout } = await exec(this.git, [
         'diff', '--name-status',
-        `origin/${entry.branch}~1`,
-        `origin/${entry.branch}`,
+        `refs/heads/${entry.branch}~1`,
+        `refs/heads/${entry.branch}`,
       ], { cwd: shadowPath, timeout: 5000 });
 
       return stdout.trim().split('\n').filter(Boolean).map(line => {
@@ -167,9 +174,9 @@ export class ShadowRepoManager {
     if (!existsSync(shadowPath)) return null;
 
     try {
-      const { stdout } = await exec(GIT, [
+      const { stdout } = await exec(this.git, [
         'diff', '--stat',
-        `origin/${entry.branch}`,
+        `refs/heads/${entry.branch}`,
         '--', // separator
       ], { cwd: shadowPath, timeout: 5000 });
 
@@ -194,7 +201,7 @@ export class ShadowRepoManager {
 
     const shadowPath = path.join(SHADOW_DIR, taskId);
     try {
-      await exec(GIT, ['fetch', 'origin', entry.branch, '--depth', '50'], {
+      await exec(this.git, ['fetch', 'origin', entry.branch, '--depth', '50'], {
         cwd: shadowPath,
         timeout: 30000,
       });

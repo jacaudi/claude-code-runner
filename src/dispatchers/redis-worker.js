@@ -1,3 +1,4 @@
+import { mkdir } from 'fs/promises';
 import { LocalDispatcher } from './local.js';
 
 const TERM_INPUT_PREFIX = 'claude:term-input:';
@@ -160,6 +161,9 @@ export class RedisWorkerExecutor {
 
     await this.queue.updateTask(task.id, { status: 'running' });
 
+    // Ensure the working directory exists on this worker pod
+    await mkdir(task.cwd || '/tmp/work', { recursive: true });
+
     return new Promise((resolve, reject) => {
       let killed = false;
 
@@ -230,7 +234,10 @@ export class RedisWorkerExecutor {
 
         console.log(`[worker] Task ${task.id} ${status} (exit: ${exitCode})`);
 
-        exitCode === 0 ? resolve() : reject(new Error(`Process exited with code ${exitCode}`));
+        // Always resolve — the status is already persisted in Redis.
+        // Rejecting here would trigger the start() catch handler to
+        // double-publish the exit status.
+        resolve();
       });
     });
   }
