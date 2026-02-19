@@ -7,6 +7,7 @@ import { createWriteStream, createReadStream, existsSync, readFileSync, writeFil
 import { fileURLToPath } from 'url';
 import path from 'path';
 import { createDispatcher } from './dispatchers/index.js';
+import { RedisQueue } from './queue/redis.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -133,10 +134,57 @@ async function requireAuth(req, res, next) {
 // Apply auth middleware to all routes except static assets
 app.use(requireAuth);
 
-const tasks = new Map();
+// ============ Redis + Dispatcher Setup ============
+
+const DISPATCH_MODE = process.env.DISPATCH_MODE || 'local';
+const REDIS_URL = process.env.REDIS_URL;
+const useRedis = DISPATCH_MODE === 'redis';
+
+let redisQueue = null;
+
+if (useRedis) {
+  if (!REDIS_URL) {
+    console.error('REDIS_URL is required when DISPATCH_MODE=redis');
+    process.exit(1);
+  }
+  redisQueue = new RedisQueue(REDIS_URL);
+  console.log(`[server] Redis mode enabled, connecting to ${REDIS_URL.replace(/\/\/.*@/, '//***@')}`);
+}
+
+const tasks = useRedis ? null : new Map(); // In-memory store only for local/k8s modes
 const WORK_DIR = '/tmp/work';
 const TASK_TIMEOUT = 60 * 60 * 1000; // 1 hour
-const dispatcher = createDispatcher();
+const dispatcher = createDispatcher(undefined, { redisQueue });
+
+// ============ Task State Helpers ============
+
+/**
+ * Unified task state accessors.
+ * In Redis mode, reads/writes go to Redis.
+ * In local/k8s mode, uses the in-memory Map.
+ */
+async function getTask(id) {
+  if (useRedis) return redisQueue.getTask(id);
+  return tasks.get(id) || null;
+}
+
+async function setTask(id, data) {
+  if (useRedis) return redisQueue.setTask(id, data);
+  tasks.set(id, data);
+}
+
+async function updateTask(id, fields) {
+  if (useRedis) return redisQueue.updateTask(id, fields);
+  const existing = tasks.get(id);
+  if (existing) tasks.set(id, { ...existing, ...fields });
+}
+
+async function listAllTasks() {
+  if (useRedis) return redisQueue.listTasks();
+  const taskList = [...tasks.entries()].map(([id, task]) => ({ id, ...task }));
+  taskList.sort((a, b) => new Date(b.started) - new Date(a.started));
+  return taskList;
+}
 
 // ============ Auth Routes ============
 
@@ -346,18 +394,19 @@ app.post('/task', async (req, res) => {
   const id = randomUUID().slice(0, 8);
   const taskDir = path.join(WORK_DIR, id);
 
-  await mkdir(taskDir, { recursive: true });
+  if (!useRedis) {
+    await mkdir(taskDir, { recursive: true });
+  }
 
-  tasks.set(id, {
+  await setTask(id, {
     status: 'running',
     prompt,
     started: new Date().toISOString(),
     logFile: path.join(taskDir, 'output.log')
   });
 
-  runTask(id, prompt, taskDir).catch(err => {
-    tasks.set(id, {
-      ...tasks.get(id),
+  runTask(id, prompt, taskDir).catch(async (err) => {
+    await updateTask(id, {
       status: 'failed',
       error: err.message,
       errorType: err.errorType || 'unknown',
@@ -368,36 +417,55 @@ app.post('/task', async (req, res) => {
   res.json({ id, status: 'queued' });
 });
 
-app.get('/task/:id', (req, res) => {
-  const task = tasks.get(req.params.id);
+app.get('/task/:id', async (req, res) => {
+  const task = await getTask(req.params.id);
   if (!task) return res.status(404).json({ error: 'Not found' });
   res.json({ id: req.params.id, ...task });
 });
 
 app.get('/task/:id/logs', async (req, res) => {
-  const task = tasks.get(req.params.id);
+  const task = await getTask(req.params.id);
   if (!task) return res.status(404).json({ error: 'Not found' });
 
   res.setHeader('Content-Type', 'text/plain');
-  createReadStream(task.logFile).pipe(res);
+
+  if (useRedis) {
+    // Serve logs from Redis buffer
+    const logs = await redisQueue.getLogBuffer(req.params.id);
+    res.send(logs);
+  } else {
+    createReadStream(task.logFile).pipe(res);
+  }
 });
 
-app.get('/health', (req, res) => {
-  res.json({
+app.get('/health', async (req, res) => {
+  const health = {
     ok: true,
-    dispatchMode: process.env.DISPATCH_MODE || 'local',
-    tasks: tasks.size,
-    running: [...tasks.values()].filter(t => t.status === 'running').length
-  });
+    dispatchMode: DISPATCH_MODE,
+  };
+
+  if (useRedis) {
+    try {
+      health.redisConnected = await redisQueue.ping();
+    } catch {
+      health.redisConnected = false;
+      health.ok = false;
+    }
+    // Count tasks from Redis
+    const allTasks = await redisQueue.listTasks().catch(() => []);
+    health.tasks = allTasks.length;
+    health.running = allTasks.filter(t => t.status === 'running').length;
+  } else {
+    health.tasks = tasks.size;
+    health.running = [...tasks.values()].filter(t => t.status === 'running').length;
+  }
+
+  res.json(health);
 });
 
 // List all tasks
-app.get('/tasks', (req, res) => {
-  const taskList = [...tasks.entries()].map(([id, task]) => ({
-    id,
-    ...task
-  }));
-  taskList.sort((a, b) => new Date(b.started) - new Date(a.started));
+app.get('/tasks', async (req, res) => {
+  const taskList = await listAllTasks();
   res.json(taskList);
 });
 
@@ -413,6 +481,15 @@ async function runTask(id, prompt, taskDir) {
   const repoDir = path.join(taskDir, 'repo');
   const branchName = `claude/${id}`;
 
+  if (useRedis) {
+    // In Redis mode, both phases are dispatched as separate queue items.
+    // The worker pod handles the actual execution.
+    await runRedisOrchestrator(id, prompt, taskDir, branchName);
+    await runRedisWorker(id, prompt, repoDir, branchName);
+    return;
+  }
+
+  // Local / K8s mode: run inline
   await appendFile(logFile, `=== Task started: ${new Date().toISOString()} ===\n`);
   await appendFile(logFile, `ID: ${id}\n`);
   await appendFile(logFile, `Prompt: ${prompt}\n\n`);
@@ -429,6 +506,106 @@ async function runTask(id, prompt, taskDir) {
 
   return result;
 }
+
+// ============ Redis-dispatched Phases ============
+
+async function runRedisOrchestrator(id, prompt, taskDir, branchName) {
+  const fullPrompt = getOrchestratorPrompt(prompt, taskDir, branchName);
+
+  return new Promise((resolve, reject) => {
+    const proc = dispatcher.spawn('claude', [
+      '-p', fullPrompt,
+      '--output-format', 'stream-json',
+      '--verbose',
+      '--dangerously-skip-permissions'
+    ], {
+      cwd: taskDir,
+      env: {
+        ...process.env,
+        GH_TOKEN: process.env.GITHUB_TOKEN
+      },
+      cols: 200,
+      rows: 50,
+      taskId: `${id}-orch`,
+      phase: 'orchestrator',
+      prompt: fullPrompt,
+    });
+
+    const timeout = setTimeout(() => {
+      proc.kill();
+      const err = new Error('Orchestrator timed out');
+      err.errorType = 'timeout';
+      reject(err);
+    }, 20 * 60 * 1000);
+
+    console.log(`[${id}] Orchestrator dispatched to Redis queue`);
+
+    proc.onData(() => {}); // Logs are handled by Redis pub/sub
+
+    proc.onExit(({ exitCode }) => {
+      clearTimeout(timeout);
+      if (exitCode !== 0) {
+        return reject(new Error(`Orchestrator exited with code ${exitCode}`));
+      }
+      console.log(`[${id}] Orchestrator completed successfully`);
+      resolve();
+    });
+  });
+}
+
+async function runRedisWorker(id, prompt, repoDir, branchName) {
+  const systemPrompt = getWorkerSystemPrompt(branchName);
+
+  return new Promise((resolve, reject) => {
+    const proc = dispatcher.spawn('claude', [
+      '-p', prompt,
+      '--system-prompt', systemPrompt,
+      '--output-format', 'stream-json',
+      '--verbose',
+      '--dangerously-skip-permissions'
+    ], {
+      cwd: repoDir,
+      env: {
+        ...process.env,
+        GH_TOKEN: process.env.GITHUB_TOKEN
+      },
+      cols: 200,
+      rows: 50,
+      taskId: `${id}-worker`,
+      phase: 'worker',
+      prompt,
+    });
+
+    const timeout = setTimeout(() => {
+      proc.kill();
+      const err = new Error('Worker timed out after 1 hour');
+      err.errorType = 'timeout';
+      reject(err);
+    }, TASK_TIMEOUT);
+
+    console.log(`[${id}] Worker dispatched to Redis queue`);
+
+    let output = '';
+    proc.onData((data) => { output += data; });
+
+    proc.onExit(async ({ exitCode }) => {
+      clearTimeout(timeout);
+
+      const prMatch = output.match(/https:\/\/github\.com\/[^\s]+\/pull\/\d+/);
+
+      await updateTask(id, {
+        status: exitCode === 0 ? 'completed' : 'failed',
+        pr_url: prMatch?.[0] || null,
+        errorType: exitCode === 0 ? null : 'exit_code',
+        finished: new Date().toISOString()
+      });
+
+      exitCode === 0 ? resolve() : reject(new Error(`Worker exited with code ${exitCode}`));
+    });
+  });
+}
+
+// ============ Local / K8s inline Phases ============
 
 async function runOrchestrator(id, prompt, taskDir, branchName, logFile) {
   const logStream = createWriteStream(logFile, { flags: 'a' });
@@ -524,9 +701,7 @@ async function runWorker(id, prompt, repoDir, branchName, logFile) {
       // Parse PR URL from worker output
       const prMatch = output.match(/https:\/\/github\.com\/[^\s]+\/pull\/\d+/);
 
-      const task = tasks.get(id);
-      tasks.set(id, {
-        ...task,
+      await updateTask(id, {
         status: exitCode === 0 ? 'completed' : 'failed',
         pr_url: prMatch?.[0] || null,
         errorType: exitCode === 0 ? null : 'exit_code',
@@ -544,4 +719,8 @@ async function runWorker(id, prompt, repoDir, branchName, logFile) {
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Claude Runner listening on :${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Claude Runner listening on :${PORT}`);
+  console.log(`Dispatch mode: ${DISPATCH_MODE}`);
+  if (useRedis) console.log(`Redis URL: ${REDIS_URL.replace(/\/\/.*@/, '//***@')}`);
+});

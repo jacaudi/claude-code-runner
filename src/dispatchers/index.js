@@ -1,5 +1,6 @@
 import { LocalDispatcher } from './local.js';
 import { KubernetesDispatcher } from './kubernetes.js';
+import { RedisDispatcher } from './redis-worker.js';
 
 /**
  * @typedef {Object} SpawnOptions
@@ -7,6 +8,9 @@ import { KubernetesDispatcher } from './kubernetes.js';
  * @property {Object} env - Environment variables
  * @property {number} [cols=200] - Terminal columns
  * @property {number} [rows=50] - Terminal rows
+ * @property {string} [taskId] - Task ID (required for redis mode)
+ * @property {string} [phase] - Task phase (orchestrator/worker, used by redis mode)
+ * @property {string} [prompt] - Task prompt (used by redis mode)
  */
 
 /**
@@ -20,10 +24,17 @@ import { KubernetesDispatcher } from './kubernetes.js';
 /**
  * Creates the appropriate dispatcher based on DISPATCH_MODE environment variable.
  *
- * @param {'local'|'kubernetes'} [mode] - Override for dispatch mode
- * @returns {LocalDispatcher|KubernetesDispatcher}
+ * Modes:
+ * - "local" (default): Runs Claude processes directly via node-pty
+ * - "kubernetes": Creates K8s Jobs via the K8s API (requires K8s API access)
+ * - "redis": Enqueues tasks to Redis for worker pods to pick up (no K8s API needed)
+ *
+ * @param {'local'|'kubernetes'|'redis'} [mode] - Override for dispatch mode
+ * @param {Object} [deps] - External dependencies
+ * @param {import('../queue/redis.js').RedisQueue} [deps.redisQueue] - Redis queue (required for redis mode)
+ * @returns {LocalDispatcher|KubernetesDispatcher|RedisDispatcher}
  */
-export function createDispatcher(mode) {
+export function createDispatcher(mode, deps = {}) {
   const dispatchMode = mode || process.env.DISPATCH_MODE || 'local';
 
   switch (dispatchMode) {
@@ -43,9 +54,15 @@ export function createDispatcher(mode) {
         githubTokenSecret: process.env.K8S_GITHUB_TOKEN_SECRET || 'github-token',
       });
 
+    case 'redis':
+      if (!deps.redisQueue) {
+        throw new Error('Redis dispatch mode requires a RedisQueue instance (pass via deps.redisQueue)');
+      }
+      return new RedisDispatcher(deps.redisQueue);
+
     default:
-      throw new Error(`Unknown DISPATCH_MODE: ${dispatchMode}. Must be "local" or "kubernetes".`);
+      throw new Error(`Unknown DISPATCH_MODE: ${dispatchMode}. Must be "local", "kubernetes", or "redis".`);
   }
 }
 
-export { LocalDispatcher, KubernetesDispatcher };
+export { LocalDispatcher, KubernetesDispatcher, RedisDispatcher };

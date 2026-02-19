@@ -52,4 +52,10 @@ RUN git config --global user.email "noreply@anthropic.com" \
     && git config --global user.name "Claude"
 
 EXPOSE 3000
-CMD ["node", "src/server.js"]
+
+# MODE selects the entrypoint:
+#   "server" (default) - API server that accepts tasks
+#   "worker" - Redis queue worker that executes tasks
+ENV MODE=server
+
+CMD ["sh", "-c", "if [ \"$MODE\" = \"worker\" ]; then node src/worker.js; else node src/server.js; fi"]
