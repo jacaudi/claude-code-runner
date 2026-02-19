@@ -1,12 +1,12 @@
 import express from 'express';
 import session from 'express-session';
 import bcrypt from 'bcryptjs';
-import pty from 'node-pty';
 import { randomUUID } from 'crypto';
 import { mkdir, rm, appendFile, readFile, writeFile, access } from 'fs/promises';
 import { createWriteStream, createReadStream, existsSync, readFileSync, writeFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import path from 'path';
+import { createDispatcher } from './dispatchers/index.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -136,6 +136,7 @@ app.use(requireAuth);
 const tasks = new Map();
 const WORK_DIR = '/tmp/work';
 const TASK_TIMEOUT = 60 * 60 * 1000; // 1 hour
+const dispatcher = createDispatcher();
 
 // ============ Auth Routes ============
 
@@ -384,6 +385,7 @@ app.get('/task/:id/logs', async (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
+    dispatchMode: process.env.DISPATCH_MODE || 'local',
     tasks: tasks.size,
     running: [...tasks.values()].filter(t => t.status === 'running').length
   });
@@ -433,7 +435,7 @@ async function runOrchestrator(id, prompt, taskDir, branchName, logFile) {
   const fullPrompt = getOrchestratorPrompt(prompt, taskDir, branchName);
 
   return new Promise((resolve, reject) => {
-    const proc = pty.spawn('claude', [
+    const proc = dispatcher.spawn('claude', [
       '-p', fullPrompt,
       '--output-format', 'stream-json',
       '--verbose',
@@ -457,7 +459,7 @@ async function runOrchestrator(id, prompt, taskDir, branchName, logFile) {
 
     let output = '';
 
-    console.log(`[${id}] Orchestrator PTY spawned, pid: ${proc.pid}`);
+    console.log(`[${id}] Orchestrator spawned, pid: ${proc.pid}`);
 
     proc.onData(data => {
       output += data;
@@ -483,7 +485,7 @@ async function runWorker(id, prompt, repoDir, branchName, logFile) {
   const systemPrompt = getWorkerSystemPrompt(branchName);
 
   return new Promise((resolve, reject) => {
-    const proc = pty.spawn('claude', [
+    const proc = dispatcher.spawn('claude', [
       '-p', prompt,
       '--system-prompt', systemPrompt,
       '--output-format', 'stream-json',
@@ -508,7 +510,7 @@ async function runWorker(id, prompt, repoDir, branchName, logFile) {
 
     let output = '';
 
-    console.log(`[${id}] Worker PTY spawned in ${repoDir}, pid: ${proc.pid}`);
+    console.log(`[${id}] Worker spawned in ${repoDir}, pid: ${proc.pid}`);
 
     proc.onData(data => {
       output += data;

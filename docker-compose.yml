@@ -8,6 +8,7 @@ services:
       - GITHUB_TOKEN=${GITHUB_TOKEN}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - PORT=3000
+      - DISPATCH_MODE=${DISPATCH_MODE:-local}
     volumes:
       # Mount only OAuth credentials, not the entire ~/.claude directory
       # This keeps debug logs and other runtime files inside the container

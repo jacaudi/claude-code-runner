@@ -7,6 +7,7 @@
     "prepare": "husky"
   },
   "dependencies": {
+    "@kubernetes/client-node": "^1.4.0",
     "bcryptjs": "^2.4.3",
     "express": "^4.18.2",
     "express-session": "^1.18.0",
