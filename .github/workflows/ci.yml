@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    uses: jacaudi/github-actions/.github/workflows/lint.yml@main
+    with:
+      shell: true
+      shellcheck-paths: docker/
+      yaml: true
+      yamllint-config: .yamllint.yml
+
+  test:
+    needs: lint
+    uses: jacaudi/github-actions/.github/workflows/test.yml@main
+    with:
+      test-framework: npm
+      node-version: '20'
+
+  docker-build:
+    needs: lint
+    uses: jacaudi/github-actions/.github/workflows/docker-build.yml@main
+    with:
+      push: false
+      platforms: linux/amd64

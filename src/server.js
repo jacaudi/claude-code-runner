@@ -1,12 +1,17 @@
 import express from 'express';
 import session from 'express-session';
 import bcrypt from 'bcryptjs';
-import pty from 'node-pty';
 import { randomUUID } from 'crypto';
 import { mkdir, rm, appendFile, readFile, writeFile, access } from 'fs/promises';
 import { createWriteStream, createReadStream, existsSync, readFileSync, writeFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import path from 'path';
+import { createDispatcher } from './dispatchers/index.js';
+import { RedisQueue } from './queue/redis.js';
+import { buildClaudeEnv, credentialStatus } from './credentials.js';
+import { ShadowRepoManager } from './git/shadow-repo.js';
+import { TerminalSessionManager } from './terminal/session-manager.js';
+import { WebSocketServer } from 'ws';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -133,9 +138,59 @@ async function requireAuth(req, res, next) {
 // Apply auth middleware to all routes except static assets
 app.use(requireAuth);
 
-const tasks = new Map();
+// ============ Redis + Dispatcher Setup ============
+
+const DISPATCH_MODE = process.env.DISPATCH_MODE || 'local';
+const REDIS_URL = process.env.REDIS_URL;
+const useRedis = DISPATCH_MODE === 'redis';
+
+let redisQueue = null;
+
+if (useRedis) {
+  if (!REDIS_URL) {
+    console.error('REDIS_URL is required when DISPATCH_MODE=redis');
+    process.exit(1);
+  }
+  redisQueue = new RedisQueue(REDIS_URL);
+  console.log(`[server] Redis mode enabled, connecting to ${REDIS_URL.replace(/\/\/.*@/, '//***@')}`);
+}
+
+const tasks = useRedis ? null : new Map(); // In-memory store only for local/k8s modes
 const WORK_DIR = '/tmp/work';
 const TASK_TIMEOUT = 60 * 60 * 1000; // 1 hour
+const dispatcher = createDispatcher(undefined, { redisQueue });
+const shadowRepos = new ShadowRepoManager();
+const terminalSessions = new TerminalSessionManager();
+
+// ============ Task State Helpers ============
+
+/**
+ * Unified task state accessors.
+ * In Redis mode, reads/writes go to Redis.
+ * In local/k8s mode, uses the in-memory Map.
+ */
+async function getTask(id) {
+  if (useRedis) return redisQueue.getTask(id);
+  return tasks.get(id) || null;
+}
+
+async function setTask(id, data) {
+  if (useRedis) return redisQueue.setTask(id, data);
+  tasks.set(id, data);
+}
+
+async function updateTask(id, fields) {
+  if (useRedis) return redisQueue.updateTask(id, fields);
+  const existing = tasks.get(id);
+  if (existing) tasks.set(id, { ...existing, ...fields });
+}
+
+async function listAllTasks() {
+  if (useRedis) return redisQueue.listTasks();
+  const taskList = [...tasks.entries()].map(([id, task]) => ({ id, ...task }));
+  taskList.sort((a, b) => new Date(b.started) - new Date(a.started));
+  return taskList;
+}
 
 // ============ Auth Routes ============
 
@@ -345,18 +400,19 @@ app.post('/task', async (req, res) => {
   const id = randomUUID().slice(0, 8);
   const taskDir = path.join(WORK_DIR, id);
 
-  await mkdir(taskDir, { recursive: true });
+  if (!useRedis) {
+    await mkdir(taskDir, { recursive: true });
+  }
 
-  tasks.set(id, {
+  await setTask(id, {
     status: 'running',
     prompt,
     started: new Date().toISOString(),
     logFile: path.join(taskDir, 'output.log')
   });
 
-  runTask(id, prompt, taskDir).catch(err => {
-    tasks.set(id, {
-      ...tasks.get(id),
+  runTask(id, prompt, taskDir).catch(async (err) => {
+    await updateTask(id, {
       status: 'failed',
       error: err.message,
       errorType: err.errorType || 'unknown',
@@ -367,36 +423,115 @@ app.post('/task', async (req, res) => {
   res.json({ id, status: 'queued' });
 });
 
-app.get('/task/:id', (req, res) => {
-  const task = tasks.get(req.params.id);
+app.get('/task/:id', async (req, res) => {
+  const task = await getTask(req.params.id);
   if (!task) return res.status(404).json({ error: 'Not found' });
   res.json({ id: req.params.id, ...task });
 });
 
 app.get('/task/:id/logs', async (req, res) => {
-  const task = tasks.get(req.params.id);
+  const task = await getTask(req.params.id);
   if (!task) return res.status(404).json({ error: 'Not found' });
 
   res.setHeader('Content-Type', 'text/plain');
-  createReadStream(task.logFile).pipe(res);
+
+  if (useRedis) {
+    // Serve logs from Redis buffer
+    const logs = await redisQueue.getLogBuffer(req.params.id);
+    res.send(logs);
+  } else {
+    createReadStream(task.logFile).pipe(res);
+  }
 });
 
-app.get('/health', (req, res) => {
-  res.json({
+app.get('/health', async (req, res) => {
+  const health = {
     ok: true,
-    tasks: tasks.size,
-    running: [...tasks.values()].filter(t => t.status === 'running').length
-  });
+    dispatchMode: DISPATCH_MODE,
+    credentials: await credentialStatus().catch(() => ({ activeProvider: 'unknown' })),
+  };
+
+  if (useRedis) {
+    try {
+      health.redisConnected = await redisQueue.ping();
+    } catch {
+      health.redisConnected = false;
+      health.ok = false;
+    }
+    // Count tasks from Redis
+    const allTasks = await redisQueue.listTasks().catch(() => []);
+    health.tasks = allTasks.length;
+    health.running = allTasks.filter(t => t.status === 'running').length;
+  } else {
+    health.tasks = tasks.size;
+    health.running = [...tasks.values()].filter(t => t.status === 'running').length;
+  }
+
+  res.json(health);
 });
 
 // List all tasks
-app.get('/tasks', (req, res) => {
-  const taskList = [...tasks.entries()].map(([id, task]) => ({
-    id,
-    ...task
-  }));
-  taskList.sort((a, b) => new Date(b.started) - new Date(a.started));
+app.get('/tasks', async (req, res) => {
+  const taskList = await listAllTasks();
   res.json(taskList);
+});
+
+// ============ Shadow Repository Endpoints ============
+
+// Get commit history for a task's branch
+app.get('/task/:id/commits', async (req, res) => {
+  const commits = await shadowRepos.getCommits(req.params.id);
+  res.json(commits);
+});
+
+// Get diff summary for most recent commit
+app.get('/task/:id/diff', async (req, res) => {
+  const diff = await shadowRepos.getLatestDiff(req.params.id);
+  res.json(diff);
+});
+
+// Get cumulative diff stats
+app.get('/task/:id/stats', async (req, res) => {
+  const stats = await shadowRepos.getDiffStats(req.params.id);
+  res.json(stats || { files: 0, insertions: 0, deletions: 0 });
+});
+
+// Force fetch latest changes for a task
+app.post('/task/:id/sync', async (req, res) => {
+  await shadowRepos.fetch(req.params.id);
+  res.json({ ok: true });
+});
+
+// ============ Credential Status ============
+
+app.get('/api/credentials', async (req, res) => {
+  const status = await credentialStatus();
+  res.json(status);
+});
+
+// ============ Terminal Endpoints ============
+
+// Terminal page (xterm.js UI)
+app.get('/task/:id/terminal', async (req, res) => {
+  const task = await getTask(req.params.id);
+  if (!task) return res.status(404).json({ error: 'Not found' });
+  let html = await readFile(path.join(__dirname, 'terminal.html'), 'utf-8');
+  // Inject WebSocket auth token so the browser can authenticate the upgrade
+  // request (session cookies don't apply to raw WebSocket upgrades).
+  html = html.replace('__WS_TOKEN__', currentToken || '');
+  res.setHeader('Content-Type', 'text/html');
+  res.send(html);
+});
+
+// Terminal session info
+app.get('/task/:id/terminal/info', (req, res) => {
+  const info = terminalSessions.getInfo(req.params.id);
+  res.json(info || { taskId: req.params.id, alive: false, viewers: 0 });
+});
+
+// List all active terminal sessions
+app.get('/api/terminal/sessions', (req, res) => {
+  res.json(terminalSessions.listSessions());
 });
 
 // Dashboard UI
@@ -411,6 +546,15 @@ async function runTask(id, prompt, taskDir) {
   const repoDir = path.join(taskDir, 'repo');
   const branchName = `claude/${id}`;
 
+  if (useRedis) {
+    // In Redis mode, both phases are dispatched as separate queue items.
+    // The worker pod handles the actual execution.
+    await runRedisOrchestrator(id, prompt, taskDir, branchName);
+    await runRedisWorker(id, prompt, repoDir, branchName);
+    return;
+  }
+
+  // Local / K8s mode: run inline
   await appendFile(logFile, `=== Task started: ${new Date().toISOString()} ===\n`);
   await appendFile(logFile, `ID: ${id}\n`);
   await appendFile(logFile, `Prompt: ${prompt}\n\n`);
@@ -420,30 +564,135 @@ async function runTask(id, prompt, taskDir) {
   await runOrchestrator(id, prompt, taskDir, branchName, logFile);
   await appendFile(logFile, `\n=== ORCHESTRATOR COMPLETE ===\n\n`);
 
+  // Start shadow repo tracking after orchestrator sets up the branch.
+  // Read the repo's remote URL so we can clone a shadow for progress monitoring.
+  await startShadowTracking(id, repoDir, branchName);
+
   // Phase 2: Worker - run in cloned repo
   await appendFile(logFile, `=== WORKER PHASE ===\n`);
   const result = await runWorker(id, prompt, repoDir, branchName, logFile);
   await appendFile(logFile, `\n=== WORKER COMPLETE ===\n`);
 
+  // Stop shadow tracking after worker completes
+  await shadowRepos.untrack(id).catch(() => {});
+
   return result;
 }
 
-async function runOrchestrator(id, prompt, taskDir, branchName, logFile) {
-  const logStream = createWriteStream(logFile, { flags: 'a' });
+// ============ Redis-dispatched Phases ============
+
+async function runRedisOrchestrator(id, prompt, taskDir, branchName) {
   const fullPrompt = getOrchestratorPrompt(prompt, taskDir, branchName);
+  const claudeEnv = await buildClaudeEnv();
 
   return new Promise((resolve, reject) => {
-    const proc = pty.spawn('claude', [
+    const proc = dispatcher.spawn('claude', [
       '-p', fullPrompt,
       '--output-format', 'stream-json',
       '--verbose',
       '--dangerously-skip-permissions'
     ], {
       cwd: taskDir,
-      env: {
-        ...process.env,
-        GH_TOKEN: process.env.GITHUB_TOKEN
-      },
+      env: claudeEnv,
+      cols: 200,
+      rows: 50,
+      taskId: `${id}-orch`,
+      phase: 'orchestrator',
+      prompt: fullPrompt,
+    });
+
+    const timeout = setTimeout(() => {
+      proc.kill();
+      const err = new Error('Orchestrator timed out');
+      err.errorType = 'timeout';
+      reject(err);
+    }, 20 * 60 * 1000);
+
+    console.log(`[${id}] Orchestrator dispatched to Redis queue`);
+
+    proc.onData(() => {}); // Logs are handled by Redis pub/sub
+
+    proc.onExit(({ exitCode }) => {
+      clearTimeout(timeout);
+      if (exitCode !== 0) {
+        return reject(new Error(`Orchestrator exited with code ${exitCode}`));
+      }
+      console.log(`[${id}] Orchestrator completed successfully`);
+      resolve();
+    });
+  });
+}
+
+async function runRedisWorker(id, prompt, repoDir, branchName) {
+  const systemPrompt = getWorkerSystemPrompt(branchName);
+  const claudeEnv = await buildClaudeEnv();
+
+  return new Promise((resolve, reject) => {
+    const proc = dispatcher.spawn('claude', [
+      '-p', prompt,
+      '--system-prompt', systemPrompt,
+      '--output-format', 'stream-json',
+      '--verbose',
+      '--dangerously-skip-permissions'
+    ], {
+      cwd: repoDir,
+      env: claudeEnv,
+      cols: 200,
+      rows: 50,
+      taskId: `${id}-worker`,
+      phase: 'worker',
+      prompt,
+    });
+
+    const timeout = setTimeout(() => {
+      proc.kill();
+      const err = new Error('Worker timed out after 1 hour');
+      err.errorType = 'timeout';
+      reject(err);
+    }, TASK_TIMEOUT);
+
+    console.log(`[${id}] Worker dispatched to Redis queue`);
+
+    // Register terminal session so web clients can attach
+    terminalSessions.register(id, proc);
+
+    let output = '';
+    proc.onData((data) => { output += data; });
+
+    proc.onExit(async ({ exitCode }) => {
+      clearTimeout(timeout);
+      terminalSessions.remove(id);
+
+      const prMatch = output.match(/https:\/\/github\.com\/[^\s]+\/pull\/\d+/);
+
+      await updateTask(id, {
+        status: exitCode === 0 ? 'completed' : 'failed',
+        pr_url: prMatch?.[0] || null,
+        errorType: exitCode === 0 ? null : 'exit_code',
+        finished: new Date().toISOString()
+      });
+
+      exitCode === 0 ? resolve() : reject(new Error(`Worker exited with code ${exitCode}`));
+    });
+  });
+}
+
+// ============ Local / K8s inline Phases ============
+
+async function runOrchestrator(id, prompt, taskDir, branchName, logFile) {
+  const logStream = createWriteStream(logFile, { flags: 'a' });
+  const fullPrompt = getOrchestratorPrompt(prompt, taskDir, branchName);
+  const claudeEnv = await buildClaudeEnv();
+
+  return new Promise((resolve, reject) => {
+    const proc = dispatcher.spawn('claude', [
+      '-p', fullPrompt,
+      '--output-format', 'stream-json',
+      '--verbose',
+      '--dangerously-skip-permissions'
+    ], {
+      cwd: taskDir,
+      env: claudeEnv,
       cols: 200,
       rows: 50
     });
@@ -457,7 +706,7 @@ async function runOrchestrator(id, prompt, taskDir, branchName, logFile) {
 
     let output = '';
 
-    console.log(`[${id}] Orchestrator PTY spawned, pid: ${proc.pid}`);
+    console.log(`[${id}] Orchestrator spawned, pid: ${proc.pid}`);
 
     proc.onData(data => {
       output += data;
@@ -481,9 +730,10 @@ async function runOrchestrator(id, prompt, taskDir, branchName, logFile) {
 async function runWorker(id, prompt, repoDir, branchName, logFile) {
   const logStream = createWriteStream(logFile, { flags: 'a' });
   const systemPrompt = getWorkerSystemPrompt(branchName);
+  const claudeEnv = await buildClaudeEnv();
 
   return new Promise((resolve, reject) => {
-    const proc = pty.spawn('claude', [
+    const proc = dispatcher.spawn('claude', [
       '-p', prompt,
       '--system-prompt', systemPrompt,
       '--output-format', 'stream-json',
@@ -491,10 +741,7 @@ async function runWorker(id, prompt, repoDir, branchName, logFile) {
       '--dangerously-skip-permissions'
     ], {
       cwd: repoDir,
-      env: {
-        ...process.env,
-        GH_TOKEN: process.env.GITHUB_TOKEN
-      },
+      env: claudeEnv,
       cols: 200,
       rows: 50
     });
@@ -508,7 +755,10 @@ async function runWorker(id, prompt, repoDir, branchName, logFile) {
 
     let output = '';
 
-    console.log(`[${id}] Worker PTY spawned in ${repoDir}, pid: ${proc.pid}`);
+    console.log(`[${id}] Worker spawned in ${repoDir}, pid: ${proc.pid}`);
+
+    // Register terminal session so web clients can attach
+    terminalSessions.register(id, proc);
 
     proc.onData(data => {
       output += data;
@@ -518,13 +768,12 @@ async function runWorker(id, prompt, repoDir, branchName, logFile) {
     proc.onExit(async ({ exitCode }) => {
       clearTimeout(timeout);
       logStream.end();
+      terminalSessions.remove(id);
 
       // Parse PR URL from worker output
       const prMatch = output.match(/https:\/\/github\.com\/[^\s]+\/pull\/\d+/);
 
-      const task = tasks.get(id);
-      tasks.set(id, {
-        ...task,
+      await updateTask(id, {
         status: exitCode === 0 ? 'completed' : 'failed',
         pr_url: prMatch?.[0] || null,
         errorType: exitCode === 0 ? null : 'exit_code',
@@ -541,5 +790,89 @@ async function runWorker(id, prompt, repoDir, branchName, logFile) {
   });
 }
 
+// ============ Shadow Repo Helpers ============
+
+/**
+ * Start shadow tracking for a task after the orchestrator clones the repo.
+ * Reads the git remote URL from the cloned repo and starts a shadow clone.
+ */
+async function startShadowTracking(taskId, repoDir, branchName) {
+  try {
+    const { execFile } = await import('child_process');
+    const { promisify } = await import('util');
+    const exec = promisify(execFile);
+
+    const gitBin = existsSync('/usr/bin/git.real') ? '/usr/bin/git.real' : 'git';
+    const { stdout } = await exec(gitBin, ['remote', 'get-url', 'origin'], {
+      cwd: repoDir,
+      timeout: 5000,
+    });
+    let repoUrl = stdout.trim();
+
+    // Inject token for authenticated HTTPS access
+    const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+    if (token && repoUrl.startsWith('https://')) {
+      repoUrl = repoUrl.replace('https://', `https://x-access-token:${token}@`);
+    }
+
+    await shadowRepos.track(taskId, repoUrl, branchName);
+    console.log(`[${taskId}] Shadow repo tracking started for ${branchName}`);
+  } catch (err) {
+    // Non-fatal — shadow tracking is optional observability
+    console.warn(`[${taskId}] Shadow repo tracking failed:`, err.message);
+  }
+}
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Claude Runner listening on :${PORT}`));
+const server = app.listen(PORT, () => {
+  console.log(`Claude Runner listening on :${PORT}`);
+  console.log(`Dispatch mode: ${DISPATCH_MODE}`);
+  if (useRedis) console.log(`Redis URL: ${REDIS_URL.replace(/\/\/.*@/, '//***@')}`);
+});
+
+// ============ WebSocket Server for Terminal ============
+
+const wss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (request, socket, head) => {
+  // Match /task/:id/terminal/ws
+  const match = request.url?.match(/^\/task\/([^/]+)\/terminal\/ws$/);
+  if (!match) {
+    socket.destroy();
+    return;
+  }
+
+  // Authenticate WebSocket upgrades via Bearer token in query string
+  // (WebSocket API doesn't support custom headers, so token is passed as ?token=...)
+  const url = new URL(request.url, `http://${request.headers.host}`);
+  const token = url.searchParams.get('token');
+  if (!currentToken || token !== currentToken) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  const taskId = match[1];
+
+  wss.handleUpgrade(request, socket, head, (ws) => {
+    // Try to attach to an existing terminal session
+    const attached = terminalSessions.attach(taskId, ws);
+    if (!attached) {
+      ws.send(JSON.stringify({
+        type: 'error',
+        message: `No active terminal session for task ${taskId}. Task may not be running.`,
+      }));
+      ws.close(1008, 'No active session');
+    }
+  });
+});
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('[server] SIGTERM received, shutting down...');
+  terminalSessions.cleanup();
+  await shadowRepos.cleanup().catch(() => {});
+  if (redisQueue) await redisQueue.close().catch(() => {});
+  wss.close();
+  server.close();
+});

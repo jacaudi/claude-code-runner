@@ -1,0 +1,79 @@
+## Redis-backed multi-container deployment
+##
+## Architecture:
+##   redis         - Shared message broker and task state store
+##   api           - Express server (accepts HTTP requests, enqueues to Redis)
+##   worker        - Pulls tasks from Redis, runs Claude locally via node-pty
+##
+## Scale workers independently:
+##   docker compose -f docker-compose.redis.yml up --scale worker=3
+##
+## Environment variables (set in .env or export):
+##   GITHUB_TOKEN              - Required, GitHub PAT with repo/read:org/workflow scopes
+##   ANTHROPIC_API_KEY         - Optional, falls back to mounted OAuth credentials
+##   CLAUDE_CODE_USE_BEDROCK   - Optional, set to "1" to use AWS Bedrock
+##   CLAUDE_CODE_USE_VERTEX    - Optional, set to "1" to use Google Vertex
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  api:
+    build: .
+    container_name: claude-runner-api
+    ports:
+      - "7334:3000"
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - CLAUDE_CODE_USE_BEDROCK=${CLAUDE_CODE_USE_BEDROCK:-}
+      - CLAUDE_CODE_USE_VERTEX=${CLAUDE_CODE_USE_VERTEX:-}
+      - PORT=3000
+      - DISPATCH_MODE=redis
+      - REDIS_URL=redis://redis:6379
+      - MODE=server
+    volumes:
+      # Copy-not-mount: credentials staged here, copied by entrypoint.sh
+      - ~/.claude/.credentials.json:/tmp/.credentials-staging/.credentials.json:ro
+      - claude-data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  worker:
+    build: .
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - CLAUDE_CODE_USE_BEDROCK=${CLAUDE_CODE_USE_BEDROCK:-}
+      - CLAUDE_CODE_USE_VERTEX=${CLAUDE_CODE_USE_VERTEX:-}
+      - REDIS_URL=redis://redis:6379
+      - MODE=worker
+    volumes:
+      # Copy-not-mount: credentials staged here, copied by entrypoint.sh
+      - ~/.claude/.credentials.json:/tmp/.credentials-staging/.credentials.json:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  claude-data:
